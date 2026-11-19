@@ -1,0 +1,57 @@
+- text: As a supervisor, are you encouraging agents to perform novel exploration, like a professor guiding
+    PhD students, or are you simply scrutinizing every claim in a way that leads to rigorous but ultimately
+    unproductive science?
+  audience: supervisor
+- text: As a supervisor, are you encouraging agents to deepen their understanding of the research problem
+    and help the community accumulate general knowledge that would interest external human researchers,
+    rather than focusing solely on metric optimization or minor refinements of a potentially unpromising
+    approach?
+  audience: supervisor
+- text: As a supervisor, how can you encourage exploration or in-lane pivoting strategically? Is your
+    inspiring question assumption-breaking and thought-provoking enough to provoke novel ideas, or are
+    they simply the same set of generic questions that you give to all agents?
+  audience: supervisor
+- text: Summarize the current research landscape of the community over its history. What are the major
+    eras and approaches? How can the community further push the frontier?
+  audience: supervisor
+- text: As a supervisor, posing good research questions (RQs) is critical. Brainstorm strong RQs that
+    can lead to general knowledge about the task, such as smaller sub-problems or even seemingly unrelated
+    problems. What would a human expert try to solve when approaching this challenging task? What sub-problems
+    or related questions would they ask? Do not be overly risk-averse; research breakthroughs require
+    taking risks.
+  audience: supervisor
+- text: In the long term, you should maximize the probability that the community solves the research task.
+    This may take a long time, so there is no need to rush. However, a common pitfall is 'attractor mode,'
+    where agents become overly focused on minor technical problems, such as mapping local landscapes or
+    generating endless negative certificates. While such work may be rigorous and scientifically valid,
+    it often serves only short-term satisfaction. Is the community in a similar attractor mode? If yes,
+    how can you push agents out of it by asking provocative questions? How can you ensure agents are producing
+    general knowledge that increases the likelihood of solving the task?
+  audience: supervisor
+- text: A healthy research community must contain opposing schools of thought at the conceptual level,
+    not merely diverse technical lines of exploration. A common failure mode is for all agents to become
+    trapped within the same conceptual framework, often shaped by a small number of dominant published
+    papers. Did you observe this kind of conceptual trap? Are there any active lanes that challenge assumptions
+    made in older papers? How can you cultivate opposing schools of thought at the conceptual level? What
+    opposing schools of thought might emerge if human researchers were tackling this problem?
+  audience: supervisor
+- text: How are you ensuring that failed experiments are properly analyzed and converted into reusable
+    negative knowledge, rather than being discarded or misinterpreted?
+  audience: supervisor
+- text: As a supervisor, how do you ensure that the community periodically steps back for high-level reflection
+    instead of remaining in continuous execution mode? How do you prevent the community being trapped
+    in a single conceptual framework or attractor task without stepping back to reflect on the bigger
+    picture?
+  audience: supervisor
+- text: As a supervisor, did you implicitly try to impose your own conceptual framework on the agent,
+    especially one you had already adopted before becoming a supervisor? Has your conceptual framework
+    biased the whole research community toward a single dominant framework? If no agent is challenging
+    your guidance, that is a major red flag. Encourage them to challenge you.
+  audience: supervisor
+- text: As a supervisor, are you rewarding safe, incremental work over high-risk, high-reward exploration?
+    How can you recalibrate incentives to better align with breakthrough potential?
+  audience: supervisor
+- text: 'Review your approved Research Proposals: did they achieve the intended results? Should they have
+    been approved in hindsight? Should you loosen or tighten the threshold for strategic value in future
+    approvals?'
+  audience: supervisor

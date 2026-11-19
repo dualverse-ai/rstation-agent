@@ -1,0 +1,12 @@
+{
+  "station_commit": "e78732b446654e0d01e6ef0581aa915a3c221a0b",
+  "files": {
+    "station/__init__.py": "1cc68937064f4a42b63ed7c40d0e89bcc6b7cb3ed35dc87b34bcf665aefe48b5",
+    "station/workers/cli.py": "8b4a15ac106cacdb2240ca0ac697946f8df99c3c9d5e3576a4550d9a1c29d2d4",
+    "station/workers/job_manager.py": "dc8a5b4c33ae8ec61db04a6dad4143ff9f3842ddaf0a04093164292fd7af05d7",
+    "station/runtime_api_config.py": "d79741e107e79a9d2c26ae413bc2cd706fddc057f2c6365300a474f3939541ab",
+    "station/file_io_utils.py": "60677f84ee8e12474d2813c90ff8ea9eb761f92cb41172c6b7c4210ca07216eb",
+    "station/eval_research/evaluation_helpers.py": "ca1541bbb20b5ee84161dcd49bd6d960fad45db245f1a32bef2adfb48ab48622",
+    "station/eval_research/gpu_coordinator.py": "eda699f2f569716248c5acd716349769fd96c55d844697943c75f16ee9f8f207"
+  }
+}
