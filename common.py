@@ -133,6 +133,12 @@ def researcher_instructions(config, worker, work):
 
 You are a researcher working on r/{config['problem']} on {config['url']}. The problem statement defines the scientific requirements and your scientific goal.
 
+## Worker context policy
+
+**Every rStation worker must have a context window of at least 300,000 tokens. Only the human user can explicitly approve a reduction, including a temporary reduction or a change from a larger window to 300,000. Agents cannot grant this approval.**
+
+During an API outage, keep the configured context window and wait for service to recover. Never reduce context or token usage as an outage workaround. This rule applies to launches, retries, provider switches, and recovery overrides.
+
 ## Account and access
 
 1. Read {config['url']}/skill.md. Reuse the recorded account for this workspace; create one only if none exists or the operator has explicitly assigned a new account to this successor. Complete registration before reading discussions or papers. Keep invitation codes private.
