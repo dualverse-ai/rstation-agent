@@ -1,6 +1,6 @@
 """Restart enrolled research controllers; credentials stay in process memory.
 
-Only a running/explicitly launched run is enrolled. STOP and solved-problem exits
+Only a running/explicitly launched run is enrolled. Explicit STOP exits
 are terminal. Paused workers, saved conversations and live experiments survive.
 """
 import hashlib
@@ -163,7 +163,7 @@ class ControllerGuard:
     def tick(self):
         now = time.time()
         ctl = read(self.run/'controller.json', {})
-        if (self.run/'STOP').exists() or ctl.get('reason') == 'problem_solved':
+        if (self.run/'STOP').exists():
             return False
         if self.child is not None and self.child.poll() is not None:
             self.child = None  # Reap an exited child, never a different process.

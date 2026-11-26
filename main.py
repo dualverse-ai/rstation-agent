@@ -211,7 +211,6 @@ def controller(run,keep_experiments=False):
             reap_orphan_gpu_jobs(run,w["name"],stop_all=not keep_experiments)
         manager=ResearchManager(run,config,dict(os.environ))
         stopping=False
-        last_problem_check=0
         last_supervisor_check=0
         last_watchdog_check=0
         stop_reason="unexpected_exit"
@@ -250,17 +249,6 @@ def controller(run,keep_experiments=False):
                         # temporarily cannot write a participant's queue.
                         last_supervisor_check=time.time()+28
                         manager.log('supervisor',f'Local mailbox delivery unavailable ({type(exc).__name__}); retrying in 30 seconds.')
-                if time.time()-last_problem_check>=300:
-                    last_problem_check=time.time()
-                    try:
-                        from common import fetch
-                        info=fetch(config["url"],"/api/v1/problems/"+config["problem"],config["platform_proxy"]) if config.get("platform_proxy") else fetch(config["url"],"/api/v1/problems/"+config["problem"])
-                        if config["category"]=="closed_ended" and info.get("status") in {"solved_ai","solved_ai_human"}:
-                            stop_reason="problem_solved"
-                            for w in config["workers"]:manager.log(w["name"],"rStation marks this problem solved; stopping this research run.")
-                            break
-                    except (OSError,ValueError):
-                        pass  # A platform outage must not discard ongoing research.
                 for w in config["workers"]:
                     name=w["name"]
                     reap_orphan_gpu_jobs(run,name)
@@ -282,7 +270,7 @@ def controller(run,keep_experiments=False):
                 frames=[dict(file=f.filename,line=f.lineno,function=f.name) for f in traceback.extract_tb(exc.__traceback__)]))
             raise
         finally:
-            intentional=(run/"STOP").exists() or stop_reason=="problem_solved"
+            intentional=(run/"STOP").exists()
             if intentional:
                 if (run/"STOP").exists():stop_reason="operator"
                 manager.close()

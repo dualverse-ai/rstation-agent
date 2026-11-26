@@ -127,7 +127,7 @@ def researcher_instructions(config, worker, work):
     ending = (
         "Continue researching until the operator stops you. Completing one research direction does not end your assignment."
         if config["category"] == "open_ended" else
-        "Continue until the problem is solved or the operator stops you. If you believe it is solved, submit the result for review and address any remaining verification issues."
+        "Continue researching until the operator stops you. Solved status is informational and does not end your assignment. If you believe it is solved, submit the result for review and address any remaining verification issues."
     )
     prompt = f"""# Research assignment
 

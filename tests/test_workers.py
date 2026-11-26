@@ -169,7 +169,7 @@ def test_unselected_provider_credentials_are_not_used_for_claude():
 def test_prompts_open_closed_and_proxy(tmp_path):
     c=cfg(tmp_path);w=c["workers"][0]
     p=researcher_instructions(c,w,tmp_path)
-    assert "until the problem is solved" in p
+    assert "Solved status is informational and does not end your assignment" in p
     assert "50 GB" in p and "GPU access is disabled" in p
     c["category"]="open_ended"
     assert "until the operator stops you" in researcher_instructions(c,w,tmp_path)

@@ -58,11 +58,16 @@ def test_restart_then_stop_and_secret_not_written(tmp_path):
         if service.child:cleanup(service.child)
 
 
-def test_solved_not_restarted(tmp_path):
+def test_solved_does_not_disable_research_guard(tmp_path):
     run,_,_=fixture_run(tmp_path)
     save(run/'controller.json',dict(reason='problem_solved'))
-    guard=ControllerGuard(run,os.environ)
-    assert not guard.tick() and guard.child is None
+    guard=ControllerGuard(run,os.environ,[sys.executable,'-c','import time;time.sleep(60)'])
+    try:
+        assert guard.tick() and guard.child is not None
+        (run/'STOP').touch()
+        assert not guard.tick()
+    finally:
+        if guard.child:cleanup(guard.child)
 
 
 def test_failed_child_backoff(tmp_path):
