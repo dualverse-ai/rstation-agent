@@ -27,7 +27,8 @@ const keyTones={working:'working',errors:'down',mixed:'degraded',unknown:'unknow
 $('key-count').textContent=(snapshot.provider_keys||[]).length+' keys'+(snapshot.key_identity_unknown?' · '+snapshot.key_identity_unknown+' worker connections unidentified':'');
 const keyRows=[];
 for(const family of ['gemini','claude','codex']){
- const keys=(snapshot.provider_keys||[]).filter(k=>k.families.includes(family));if(!keys.length)continue;
+ const priority=k=>Math.min(...k.names.filter(n=>n.toLowerCase().startsWith(family+' ')).map(n=>/ primary$/.test(n)?0:Number(n.match(/ backup (\d+)$/)?.[1]??999)),999);
+ const keys=(snapshot.provider_keys||[]).filter(k=>k.families.includes(family)).sort((a,b)=>priority(a)-priority(b)||a.endpoint.localeCompare(b.endpoint)||a.id.localeCompare(b.id));if(!keys.length)continue;
  const heading=node('tr',undefined,'key-group');heading.dataset.family=family;const title=node('th',family[0].toUpperCase()+family.slice(1)+' · '+keys.length+' keys');title.colSpan=6;title.scope='colgroup';heading.append(title);keyRows.push(heading);
  keyRows.push(...keys.map(k=>{const tr=node('tr');const name=cell(tr,k.names.join(' / ')+' · '+k.id.slice(0,6),(k.models.length?k.models.join(', '):k.families.join(', '))+' · '+k.hosts.join(', '));name.title=k.names.join(', ');cell(tr,k.endpoint);const status=cell(tr,'');status.append(node('span',keyLabels[k.status],'badge '+keyTones[k.status]));if(k.errors.length)status.append(node('small',k.errors.map(e=>/^\d+$/.test(e)?'HTTP '+e:e).join(', ')));tr.append(timeCell(k.last_response));cell(tr,k.workers);const trend=cell(tr,'');const strip=node('div',undefined,'key-history');k.history.forEach((value,i)=>{const bar=node('span',undefined,'cell '+(value?keyTones[value]:''));const at=(Math.floor(snapshot.now/300)-17+i)*300;bar.title=new Date(at*1000).toLocaleString()+' · '+(value?keyLabels[value]:'No observation');strip.append(bar);});trend.append(strip);return tr;}));
 }
