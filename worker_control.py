@@ -125,7 +125,8 @@ def queue_request(run, name, *, expected_revision, model=None, provider_route=No
             raise ValueError('Resolve the existing refusal or missing-session condition first.')
         if (folder / 'session-adoption.json').exists():
             raise ValueError('Finish the pending session adoption first.')
-        pool = routes(base['worker']['kind'], os.environ if environment is None else environment)
+        from provider_control import operator_pool
+        pool = operator_pool(run,name,state,os.environ if environment is None else environment)
         if change_route and provider_route is not None and (type(provider_route) is not int or not 1 <= provider_route <= len(pool)):
             raise ValueError('Provider route must be a one-based configured index, or auto.')
         work = folder.parent.resolve(strict=True); stat = work.stat()
@@ -189,7 +190,7 @@ def _process_requests(manager):
                 (folder / 'worker-control-ready.json').unlink(missing_ok=True)
                 continue
             current = read(manager.run / 'run.json', {})
-            pool = manager.route_lists[original['kind']]
+            pool = manager.provider_pool(name)
             work = folder.parent.resolve(); stat = work.stat()
             if (control.get('revision', 0) != request['spec']['expected_revision'] or
                     state.get('token') != request['session_id'] or state.get('session_unavailable') or
@@ -259,6 +260,8 @@ def process_requests(manager):
 
 
 def guard_launch(manager, name):
+    from provider_control import guard_session
+    guard_session(manager,name)
     state = manager.states[name]
     hold = state.get('worker_control_hold')
     if hold:
@@ -273,7 +276,7 @@ def guard_launch(manager, name):
     valid = (state.get('token') == control['session_id'] and not state.get('session_unavailable') and
              control['base_sha256'] == fingerprint(base_settings(manager.config, name)) and
              control['base_sha256'] == fingerprint(base_settings(read(manager.run / 'run.json', {}), name)) and
-             control['pool_sha256'] == fingerprint(manager.route_lists[original['kind']]))
+             control['pool_sha256'] == fingerprint(manager.provider_pool(name)))
     if not valid:
         state.update(token=control['session_id'], status='blocked', blocked_reason='worker_control_conflict')
         manager.persist(name)
@@ -288,6 +291,9 @@ def selected_route(state, default):
 def handle_failure(manager, name, failure):
     state = manager.states[name]
     control = state.get('worker_control')
+    if not control:
+        from provider_control import failure_control
+        control = failure_control(manager,name)
     request = checkpoint_requested(manager.run / name)
     if not control and not request: return False
     session_id = control['session_id'] if control else request['session_id']

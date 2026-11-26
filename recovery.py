@@ -132,7 +132,8 @@ class ResearchManager(CliJobManager):
         self.run,self.config,self.env=Path(run),config,dict(env)
         self.probe=probe
         self.states={};self.routers={};self.log_offsets={};self.pending_tools={}
-        self.route_lists={kind:routes(kind,env) for kind in {w["kind"] for w in config["workers"]}}
+        from provider_control import initial_routes
+        self.route_lists=initial_routes(run,config,env)
         self.bin_paths={kind:executable(kind,env) for kind in self.route_lists}
         constants.CLI_WORKER_TRANSCRIPT_IDLE_TIMEOUT_SECONDS=config.get("idle_seconds",1800)
         for worker in config["workers"]:
@@ -148,6 +149,9 @@ class ResearchManager(CliJobManager):
             self._endpoint_resume_counts[name]=state.get("route_count",0)
             (self.run/name/".runtime").mkdir(parents=True,exist_ok=True,mode=0o700)
         self.last_storage=0
+        if not probe:
+            from provider_control import initialize
+            initialize(self)
 
     @staticmethod
     def _resume_backoff_schedule(): return BACKOFF
@@ -157,9 +161,14 @@ class ResearchManager(CliJobManager):
     def worker(self,name):
         from worker_control import effective_worker
         return effective_worker(next(w for w in self.config["workers"] if w["name"]==name), self.states.get(name, {}))
+    def provider_pool(self,name):
+        from provider_control import pool_for
+        return pool_for(self,name)
     def persist(self,name):
         save(self.run/name/".runtime/state.json",self.states[name])
     def log(self,name,text):
+        for secret in getattr(self,"_provider_secrets",set()):
+            if secret:text=text.replace(secret,"[redacted]")
         # Do not print raw provider errors or request bodies, which can echo keys.
         for route_list in self.route_lists.values():
             for route in route_list:
@@ -167,6 +176,8 @@ class ResearchManager(CliJobManager):
         line=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime())+" "+text+"\n"
         with (self.run/name/".runtime/console.log").open("a") as f:f.write(line)
     def _load_cli_job_state(self,name):
+        from provider_control import refresh
+        refresh(self,name)
         from worker_control import guard_launch
         if not guard_launch(self,name):
             s=self.states[name]
@@ -189,26 +200,26 @@ class ResearchManager(CliJobManager):
         count=decision.endpoint_resume_count or 0
         # Reconsider the preferred route only when launching a new native turn.
         # A small probe must never interrupt a productive backup conversation.
-        index=(w.get("route_seed",0)+self.states[name].get("route_offset",0)+count//2)%len(self.route_lists[w["kind"]])
+        index=(w.get("route_seed",0)+self.states[name].get("route_offset",0)+count//2)%len(self.provider_pool(name))
         recovery_route=self.states[name].pop("gemini_recovery_route",None)
         from worker_control import selected_route
         controlled=selected_route(self.states[name],None)
         if controlled is not None:
             index=controlled
         elif w["kind"]=="gemini" and recovery_route is not None:
-            index=recovery_route%len(self.route_lists["gemini"])
+            index=recovery_route%len(self.provider_pool(name))
             self.states[name]["route_offset"]=index-w.get("route_seed",0)-count//2
         elif index and not self.probe and not self._untried_session_routes(name) and self._primary_recovered(name):
             index=0
             self.states[name]["route_offset"]=-w.get("route_seed",0)-count//2
             self.log(name,"Primary provider recovered; continuing the same conversation on provider 1.")
-        route=self.route_lists[w["kind"]][index]
+        route=self.provider_pool(name)[index]
         self.states[name]["route_index"]=index
         # Model traffic is direct unless the run explicitly selects a proxy.
         # This also covers legacy run files with a missing/null setting.
         model_proxy=self.config.get("model_api_proxy") or "direct"
         if model_proxy=="direct":model_proxy=None
-        hosts={urlsplit(r["base_url"]).hostname for r in self.route_lists[w["kind"]]}
+        hosts={urlsplit(r["base_url"]).hostname for r in self.provider_pool(name)}
         # Apply hostname-specific connectivity fixes on the next launch only;
         # existing native turns and their open connections remain untouched.
         configured=read(self.run/"run.json",self.config).get("model_api_host_proxies") or {}
@@ -226,6 +237,7 @@ class ResearchManager(CliJobManager):
                                          [urlsplit(self.config["url"]).hostname],
                                          host_proxies=host_proxies).__enter__()
             else:
+                self.routers[name].model_hosts=hosts
                 self.routers[name].model_proxy=model_proxy
                 self.routers[name].host_proxies=host_proxies
             proxy_env={key:self.routers[name].url for key in
@@ -243,7 +255,7 @@ class ResearchManager(CliJobManager):
         env.update(proxy_env)
         env["PATH"]=str(work/".venv/bin")+":"+env["PATH"]
         for key in ("CONDA_PREFIX","CONDA_DEFAULT_ENV","PYTHONHOME"):env.pop(key,None)
-        direct_models = [urlsplit(r["base_url"]).hostname for r in self.route_lists[w["kind"]]
+        direct_models = [urlsplit(r["base_url"]).hostname for r in self.provider_pool(name)
                          if urlsplit(r["base_url"]).hostname not in host_proxies] if not model_proxy else []
         bypass=",".join(dict.fromkeys(["localhost","127.0.0.1","::1"]+direct_models+([] if self.config.get("platform_proxy") else [urlsplit(self.config["url"]).hostname])))
         env.update(NO_PROXY=bypass,no_proxy=bypass)
@@ -275,7 +287,7 @@ class ResearchManager(CliJobManager):
             prompt+="\nYour previous session was interrupted. Read CONTINUATION.md and your saved notes, reuse your account and workspace, and continue the existing research.\n"
             if claimed.get("session_recovery"):
                 prompt+="The preserved previous session state and continuation are in .runtime/session-recovery/. Check existing experiments before launching anything new.\n"
-        self.log(name,f"{'Resuming' if decision.is_resume else 'Starting'} {w['model']}; provider {index+1}/{len(self.route_lists[w['kind']])}; {session_id}")
+        self.log(name,f"{'Resuming' if decision.is_resume else 'Starting'} {w['model']}; provider {index+1}/{len(self.provider_pool(name))}; {session_id}")
         return CliJobLaunchSpec(self.bin_paths[w["kind"]][0],str(work/".runtime"/session_id),w["kind"],w["model"],str(work),str(work),prompt,env,
                 network_access=not self.config.get("disable_web",False),
                 codex_config_overrides=('features.enable_request_compression=false',
@@ -288,7 +300,7 @@ class ResearchManager(CliJobManager):
         # One probe per model per controller, shared by its workers and retained
         # across controller restarts. Never store credentials in this state.
         for other in self.config["workers"]:
-            if (other["kind"],other["model"])==(worker["kind"],worker["model"]):
+            if (other["kind"],self.worker(other["name"])["model"])==(worker["kind"],worker["model"]) and self.provider_pool(other["name"]) == self.provider_pool(name):
                 self.states[other["name"]].update(primary_checked_at=checked_at,primary_healthy=healthy)
                 self.persist(other["name"])
 
@@ -318,6 +330,7 @@ class ResearchManager(CliJobManager):
             manager=None
             try:
                 manager=ResearchManager(directory,config,self.env,probe=True)
+                manager._provider_pools = {worker["name"]: self.provider_pool(worker["name"])}
                 manager.launch_cli_job(worker["name"])
                 deadline=time.monotonic()+PRIMARY_PROBE_SECONDS
                 while manager.active_sessions and time.monotonic()<deadline:
@@ -482,7 +495,7 @@ class ResearchManager(CliJobManager):
     def _untried_session_routes(self,name):
         state=self.states[name];streak=state.get("session_failure_streak",{})
         return (bool(streak) and self._research_progress(state)<=streak["progress"]
-                and len(streak["routes"])<len(self.route_lists[self.worker(name)["kind"]]))
+                and len(streak["routes"])<len(self.provider_pool(name)))
 
     def _session_recovery_protected(self,name,session):
         """A terminal CLI may still own orphaned tools or background jobs."""
@@ -543,7 +556,7 @@ class ResearchManager(CliJobManager):
         previous=state.get("session_recovery",{})
         if (streak["failures"]<SESSION_RECOVERY_FAILURES
                 or now-max(streak["since"],progress)<SESSION_RECOVERY_IDLE_SECONDS
-                or len(streak["routes"])<len(self.route_lists[self.worker(name)["kind"]])
+                or len(streak["routes"])<len(self.provider_pool(name))
                 or (previous and (progress<=previous["progress"]
                                   or now-previous["at"]<SESSION_RECOVERY_COOLDOWN_SECONDS))
                 or self._session_recovery_protected(name,session)):
@@ -557,7 +570,7 @@ class ResearchManager(CliJobManager):
         record=dict(at=now,progress=progress,previous_token=token,failures=streak["failures"],
                     routes=streak["routes"],archive=str(directory.relative_to(self.run/name)))
         save(directory/"recovery.json",record)
-        next_route=(state.get("route_index",0)+1)%len(self.route_lists[self.worker(name)["kind"]])
+        next_route=(state.get("route_index",0)+1)%len(self.provider_pool(name))
         state.update(token=None,resumes=0,route_count=0,next=now+60,status="retrying",pid=None,
                      route_offset=next_route-self.worker(name).get("route_seed",0),
                      session_unavailable=True,session_recovery=record)
@@ -671,7 +684,7 @@ class ResearchManager(CliJobManager):
             session.transcript_idle_timeout_triggered=True
             session.transcript_idle_timeout_reason="Provider retries without research progress exceeded the idle limit."
             if session.backend=="gemini":
-                state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.route_lists["gemini"])
+                state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.provider_pool(name))
                 self.persist(name)
             self.log(name,"Provider retry notices continued without research progress; resuming the saved conversation through the normal provider rotation.")
 
@@ -681,7 +694,7 @@ class ResearchManager(CliJobManager):
         self.states[name]["kill_after"]=time.time()+10
         if session.backend=="gemini":
             state=self.states[name]
-            state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.route_lists["gemini"])
+            state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.provider_pool(name))
             self.persist(name)
             self.log(name,"Gemini stream stalled without live tool/experiment work; rotating provider and resuming the same conversation.")
         else:
@@ -770,11 +783,11 @@ class ResearchManager(CliJobManager):
                     else:state[key]=value
                 state.update(response_step=index,response_text=text)
                 state["last_error"]="Gemini provider returned an account restriction notice."
-                state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.route_lists["gemini"])
+                state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.provider_pool(name))
                 return
         if provider_account_error(event.get("result",{}).get("response")):
             state["last_error"]="Gemini provider returned an account restriction notice."
-            state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.route_lists["gemini"])
+            state["gemini_recovery_route"]=(state.get("route_index",0)+1)%len(self.provider_pool(name))
             return
         # Tool-only model turns have usage but no text delta in the native stream.
         usage=step.get("usage",{})
@@ -842,4 +855,4 @@ class ResearchManager(CliJobManager):
             self._abort_cli_job_process(session);self._close_cli_job_session_handles(session)
             self.states[name].update(pid=None,status="stopped");self.persist(name)
         self.active_sessions.clear()
-        for router in self.routers.values():router.__exit__(None,None,None)
+        for router in [*self.routers.values(), *getattr(self,"_provider_retired_routers",[])]:router.__exit__(None,None,None)

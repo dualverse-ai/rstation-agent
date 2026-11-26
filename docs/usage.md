@@ -48,3 +48,27 @@ The controller waits for this researcher to finish its current turn and for its 
 Status reports the pending request and its applied or rejected receipt. Repeating the same request at the same expected revision returns that receipt. Supply a new `--request-id UUID` to explicitly retry a rejected request after resolving its cause. A changed session, configuration or provider list rejects the pending change. Missing sessions and model refusals remain blocked for operator resolution. After a change, provider outages retry the saved session; an unexplained or permanent failure holds it for inspection.
 
 Worker overrides are saved with that worker’s runtime state. Editing the roster model in `run.json` does not replace an applied worker override; manage that researcher through this command. Adding credentials or endpoints to a running controller is a separate profile rollout.
+
+## Update provider keys, endpoints and order
+
+Run `./agents providers RUN_NAME status` to read the provider revision and the active and requested revision for each researcher. Run the command as the research controller's account with its rStation-purpose profile loaded.
+
+Prepare a private JSON file (mode `0600`) containing the complete ordered provider list. Keep the same `id` for a provider when changing its key or address; moving its record changes the automatic preference order. Initial provider IDs are `route-1`, `route-2`, and so on, matching the previous order.
+
+```json
+{"providers":[{"id":"route-1","api_key":"REPLACEMENT_KEY","base_url":"https://provider.example/v1"}]}
+```
+
+Apply it to one researcher, using the revision returned by status:
+
+```bash
+./agents providers RUN_NAME apply --worker gemini_1 --expect-revision 0 --file /private/providers.json
+```
+
+Use `--family gemini` instead of `--worker gemini_1` to update every Gemini researcher in that run. Codex and Claude are also supported. The file can contain multiple providers and optional `http_proxy` and `https_proxy` fields. The run's existing model-network policy remains in effect. Never put keys in command arguments or terminal output.
+
+The command checks every proposed route with each affected researcher's effective model in a disposable native conversation. A failed check leaves the current settings unchanged. Validation is a connectivity check at that time; later provider outages still use normal recovery. The command rejects concurrent settings changes and removal of a pinned provider. Reordering retains a researcher's pin to the same provider ID; use the worker route command to choose another provider after the update applies.
+
+Each researcher loads the validated list on its next native client launch, without reloading the controller or stopping an active client, tool or GPU job. A long-running client keeps its current credentials until it next launches. Status distinguishes a validated request from an applied revision. Paused researchers remain paused. Saved conversations, context budgets, workspaces and messages remain intact. A provider update does not clear a refusal or other existing worker block.
+
+The launcher stores the validated routes in private operator storage under the run, separate from worker state and receipts. Restarted controllers recover the active provider revision from that storage. Editing a shell profile alone does not change running clients. Updates cover the named research workers; coder and council provider settings remain separate.

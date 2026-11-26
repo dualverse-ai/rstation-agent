@@ -385,6 +385,12 @@ def parser():
 def main(argv=None):
     os.umask(0o077)
     argv=list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0]=='providers':
+        from provider_control import cli
+        try: cli(argv[1:])
+        except (ValueError, OSError, KeyError, TypeError):
+            raise SystemExit('Provider command failed; no credentials are shown. Check the private input, controller account and current status.') from None
+        return
     if argv and argv[0]=='worker':
         from worker_control import cli
         try: cli(argv[1:])
