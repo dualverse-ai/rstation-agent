@@ -54,6 +54,18 @@ def family_summary(rows, now):
  return result
 
 
+def key_observation(key_id,rows,now):
+ selected=[r for r in rows if r.get('provider_key_id')==key_id and not r.get('intentional_stop') and 0<=now-r.get('sampled_at',0)<=300]
+ responses=[r['last_response'] for r in selected if r.get('started_at') and r.get('last_response') and r['started_at']<=r['last_response']<=now]
+ latest=max(responses,default=None)
+ failing=[r for r in selected if r.get('started_at') and (r.get('last_response') or 0)<r['started_at'] and r.get('state') in ('retrying','blocked','paused','stopped') and (r.get('error',{}).get('http_status') or r.get('error',{}).get('category')=='provider_unavailable')]
+ recent=latest is not None and now-latest<=600
+ status='mixed' if recent and failing else 'working' if recent else 'errors' if failing else 'unknown'
+ errors=sorted({str(r.get('error',{}).get('http_status') or 'provider unavailable') for r in failing})
+ return {'status':status,'last_response':latest,'workers':len(selected),'errors':errors,
+         'models':sorted({r.get('model') for r in selected if r.get('model')})}
+
+
 class Store:
  def __init__(self,path):
   self.path=Path(path);self.path.parent.mkdir(parents=True,exist_ok=True)
@@ -63,6 +75,9 @@ CREATE TABLE IF NOT EXISTS samples(worker TEXT,at REAL,health TEXT,response REAL
 CREATE TABLE IF NOT EXISTS current(worker TEXT PRIMARY KEY,body TEXT);
 CREATE TABLE IF NOT EXISTS hosts(host TEXT PRIMARY KEY,at REAL,error TEXT);
 CREATE TABLE IF NOT EXISTS profiles(handle TEXT PRIMARY KEY,at REAL,body TEXT);
+CREATE TABLE IF NOT EXISTS key_inventory(host TEXT,key_id TEXT,name TEXT,at REAL,body TEXT,PRIMARY KEY(host,key_id,name));
+CREATE TABLE IF NOT EXISTS key_samples(host TEXT,key_id TEXT,at REAL,status TEXT,response REAL,PRIMARY KEY(host,key_id,at));
+CREATE INDEX IF NOT EXISTS key_samples_at ON key_samples(at);
 CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
 ''')
  @contextmanager
@@ -79,6 +94,12 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     state,reason=health(row,now);row=dict(row,health=state,health_reason=reason)
     con.execute('INSERT OR REPLACE INTO current VALUES(?,?)',(row['id'],json.dumps(row)))
     con.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?)',(row['id'],now,state,row.get('last_response'),row.get('last_tool'),len(row.get('gpu',[]))))
+   for key in snapshot.get('provider_keys',[]):
+    con.execute('INSERT OR REPLACE INTO key_inventory VALUES(?,?,?,?,?)',(snapshot['host'],key['id'],key['name'],now,json.dumps(key)))
+   for ident in {k['id'] for k in snapshot.get('provider_keys',[])}:
+    observation=key_observation(ident,snapshot['workers'],now)
+    con.execute('INSERT OR REPLACE INTO key_samples VALUES(?,?,?,?,?)',(snapshot['host'],ident,now,observation['status'],observation['last_response']))
+   con.execute('DELETE FROM key_samples WHERE at<?',(now-8*86400,))
    con.execute('DELETE FROM samples WHERE at<?',(now-8*86400,))
  def failed(self,host):
   with self.connect() as con:con.execute('INSERT INTO hosts VALUES(?,?,?) ON CONFLICT(host) DO UPDATE SET error=excluded.error',(host,0,'collection_failed'))
@@ -90,6 +111,9 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
    rows=[json.loads(x[0]) for x in con.execute('SELECT body FROM current')]
    hosts=[{'host':h,'sampled_at':at,'error':error,'stale':now-at>300} for h,at,error in con.execute('SELECT * FROM hosts')]
    profiles={h:(at,json.loads(body)) for h,at,body in con.execute('SELECT * FROM profiles')}
+   inventory=list(con.execute('SELECT host,key_id,name,at,body FROM key_inventory'))
+   key_responses=dict(con.execute('SELECT key_id,MAX(response) FROM key_samples GROUP BY key_id'))
+   key_samples=list(con.execute('SELECT key_id,at,status FROM key_samples WHERE at>=? ORDER BY at',(now-5400,)))
    samples={}
    for worker,at,state,response,tool,gpus in con.execute('SELECT * FROM samples WHERE at>=? ORDER BY at',(now-7*86400,)):
     samples.setdefault(worker,[]).append((at,state,response,tool,gpus))
@@ -122,8 +146,26 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
    p['stale']|=now-row.get('sampled_at',0)>300
    if row.get('error',{}).get('category') and row['state'] in ('blocked','retrying'):
     p['last_error']=row['error']
+  keys={}
+  for host,ident,name,at,body in inventory:
+   info=json.loads(body)
+   k=keys.setdefault(ident,{'id':ident,'names':set(),'endpoint':info['endpoint'],'hosts':set(),'families':set(),'sampled_at':0})
+   k['names'].add(name);k['hosts'].add(host);k['families'].add(info['family']);k['sampled_at']=max(k['sampled_at'],at)
+  for ident,k in keys.items():
+   k.update(key_observation(ident,rows,now));k['names']=sorted(k['names']);k['hosts']=sorted(k['hosts']);k['families']=sorted(k['families']);k['history']=[None]*18
+   k['last_response']=max(k['last_response'] or 0,key_responses.get(ident) or 0) or None
+   if now-k['sampled_at']>300:k['status']='unknown'
+   elif k['status']=='unknown' and k['last_response'] and 0<=now-k['last_response']<=600:k['status']='working'
+  priority={'unknown':0,'working':1,'mixed':2,'errors':3}
+  for ident,at,status in key_samples:
+   if ident not in keys:continue
+   index=int(at//300)-int(now//300)+17
+   if 0<=index<18:
+    old=keys[ident]['history'][index]
+    if old is None or priority[status]>priority[old]:keys[ident]['history'][index]=status
+  key_rows=sorted(keys.values(),key=lambda k:({'errors':0,'mixed':1,'unknown':2,'working':3}[k['status']],k['endpoint'],k['names']))
   rows.sort(key=lambda r:(ORDER[r['health']],r.get('problem') or '',r['id']))
-  return {'now':now,'counts':counts,'hosts':hosts,'workers':rows,'providers':list(providers.values()),'families':family_summary(rows,now),'history_start':min((v[0][0] for v in samples.values() if v),default=None)}
+  return {'now':now,'counts':counts,'hosts':hosts,'workers':rows,'providers':list(providers.values()),'families':family_summary(rows,now),'provider_keys':key_rows,'key_identity_unknown':sum(not r.get('provider_key_id') and r['health']!='intentional' for r in rows),'history_start':min((v[0][0] for v in samples.values() if v),default=None)}
 
 
 def fetch_public(handle):

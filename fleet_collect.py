@@ -48,18 +48,139 @@ def error(state):
  return {'category':category,'http_status':int(match[1]) if match else None}
 
 
+# This code is embedded in the single read-only host collector.
+
+def process_provider_environment(pid,token):
+ """Inspect only an identified rStation process; secret values never leave the host."""
+ if not alive(pid,token):return {}
+ allowed={prefix+family+'_'+backup+field for prefix in ('','RSTATION_WORKER_') for family in ('CODEX','CLAUDE','GEMINI') for backup in ('','BACKUP_') for field in ('API_KEY','BASE_URL')}
+ allowed.update(('ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','GOOGLE_GEMINI_BASE_URL'))
+ try:
+  raw=Path('/proc',str(int(pid)),'environ').read_bytes()
+  if len(raw)>1024*1024:return {}
+  values={}
+  for item in raw.split(b'\0'):
+   name,sep,value=item.partition(b'=')
+   name=name.decode('ascii',errors='ignore')
+   if sep and name in allowed:values[name]=value.decode('utf-8',errors='replace')
+  return values if alive(pid,token) else {}
+ except (OSError,ValueError):return {}
+
+
+def safe_endpoint(value):
+ from urllib.parse import urlsplit
+ try:
+  p=urlsplit(value)
+  if p.scheme not in ('https','http') or not p.hostname:return None
+  host=p.hostname
+  if not re.fullmatch(r'[A-Za-z0-9.:-]{1,253}',host):return None
+  if ':' in host:host='['+host+']'
+  # Omit userinfo, query, fragment, and arbitrary path segments that may be tokens.
+  path=p.path if p.path in ('','/','/v1','/v1/','/v1beta','/v1beta/','/api','/api/','/anthropic','/anthropic/') else ''
+  return p.scheme+'://'+host+(':'+str(p.port) if p.port else '')+path.rstrip('/')
+ except (TypeError,ValueError):return None
+
+
+def key_metadata(key,endpoint,family,index,source):
+ endpoint=safe_endpoint(endpoint)
+ if not isinstance(key,str) or not key or not endpoint or family not in ('codex','claude','gemini'):return None
+ ident=hashlib.sha256((endpoint+'\0'+key).encode()).hexdigest()
+ return {'id':ident,'name':family.capitalize()+' '+('primary' if index==0 else 'backup '+str(index)),
+         'endpoint':endpoint,'family':family,'route':index+1,'source':source}
+
+
+def configured_pool(env,family):
+ prefix=family.upper()+'_'
+ def value(field):return env.get(prefix+field,env.get('RSTATION_WORKER_'+prefix+field,''))
+ primary=value('API_KEY');endpoint=value('BASE_URL')
+ if not primary or not endpoint:return []
+ pool=[{'api_key':primary,'base_url':endpoint}]
+ backups=value('BACKUP_API_KEY').split(';') if value('BACKUP_API_KEY') else []
+ urls=value('BACKUP_BASE_URL').split(';') if value('BACKUP_BASE_URL') else ['']*len(backups)
+ if len(urls)==1 and len(backups)>1:urls*=len(backups)
+ if len(backups)!=len(urls):return pool
+ pool.extend({'api_key':key.strip(),'base_url':url.strip() or endpoint} for key,url in zip(backups,urls) if key.strip())
+ return pool
+
+
+
+def profile_environment(root):
+ """Read literal rStation-purpose assignments; never execute or source shell code."""
+ import shlex
+ result={}
+ for path in (Path(root)/'.env',Path.home()/'bin/rstation-api.env'):
+  try:
+   if path.stat().st_size>1024*1024:continue
+   lines=path.read_text().splitlines()
+  except OSError:continue
+  for line in lines:
+   match=re.match(r'\s*(?:export\s+)?((?:RSTATION_WORKER_)?(?:CODEX|CLAUDE|GEMINI)_(?:BACKUP_)?(?:API_KEY|BASE_URL|HTTP_PROXY|HTTPS_PROXY))=(.*)$',line)
+   if not match:continue
+   try:parts=shlex.split(match[2],comments=True)
+   except ValueError:continue
+   if len(parts)!=1 or '$' in parts[0] or '`' in parts[0]:continue
+   result[match[1]]=parts[0]
+ return result
+
+
+def pool_fingerprint(pool,env,family):
+ prefix=family.upper()+'_'
+ def value(field):return env.get(prefix+field,env.get('RSTATION_WORKER_'+prefix+field,''))
+ enriched=[]
+ for i,route in enumerate(pool):
+  item=dict(route)
+  for field in ('HTTP_PROXY','HTTPS_PROXY'):
+   parts=value('BACKUP_'+field).split(';') if value('BACKUP_'+field) else []
+   item[field.lower()]=value(field) if i==0 else parts[i-1] if i<=len(parts) else ''
+  enriched.append(item)
+ return hashlib.sha256(json.dumps(enriched,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+def worker_key_inventory(run,worker,state,controller_env,profile_env=None):
+ family=worker.get('kind');pool=configured_pool(controller_env,family) if family in ('codex','claude','gemini') else []
+ registry=read(run/'.provider-control/providers.json');record=registry.get('workers',{}).get(worker['name'])
+ source='controller configuration'
+ verified=bool(pool)
+ if not pool and profile_env:
+  pool=configured_pool(profile_env,family) if family in ('codex','claude','gemini') else []
+  source='configured profile; connection unverified'
+  expected=state.get('providers',{}).get('pool_sha256') or state.get('worker_control',{}).get('pool_sha256') or state.get('session_adoption',{}).get('provider_route',{}).get('pool_sha256')
+  verified=bool(pool and expected and pool_fingerprint(pool,profile_env,family)==expected)
+  if verified:source='matching saved route fingerprint'
+ if isinstance(record,dict):
+  revision=state.get('providers',{}).get('revision',0)
+  if revision==record.get('revision'):pool=record.get('after',[]);source='active provider revision';verified=True
+  elif revision==record.get('before_revision'):pool=record.get('before',[]);source='active provider revision';verified=True
+  else:pool=[];verified=False
+ result=[]
+ for i,r in enumerate(pool):
+  if not isinstance(r,dict):continue
+  meta=key_metadata(r.get('api_key'),r.get('base_url'),family,i,source)
+  if meta:result.append(meta)
+ selected=None;index=state.get('route_index')
+ if verified and type(index)==int and 0<=index<len(pool):selected=key_metadata(pool[index].get('api_key'),pool[index].get('base_url'),family,index,source)
+ native=process_provider_environment(state.get('pid'),state.get('pid_token'))
+ names={'codex':('CODEX_API_KEY','CODEX_BASE_URL'),'claude':('ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL'),'gemini':('GEMINI_API_KEY','GOOGLE_GEMINI_BASE_URL')}
+ if family in names and native:
+  key_name,url_name=names[family];actual=key_metadata(native.get(key_name),native.get(url_name),family,index if type(index)==int else 0,'live worker connection')
+  if actual:selected=actual;result.append(actual)
+ return result,selected
+
+
 def collect(roots,host):
- now=time.time();rows=[];failures=[]
+ now=time.time();rows=[];failures=[];inventory={}
  for root in roots:
-  root=Path(root);data=root/'agent_data'
+  root=Path(root);data=root/'agent_data';profile_env=profile_environment(root)
   if not data.is_dir():failures.append('missing_root');continue
   for config_path in sorted(data.glob('*/run.json')):
    run=config_path.parent;config=read(config_path);ctl=read(run/'controller.json')
    if not isinstance(config.get('workers'),list):continue
+   controller_env=process_provider_environment(ctl.get('pid'),ctl.get('token'))
    for worker in config['workers']:
     if not isinstance(worker,dict) or not label(worker.get('name')) or Path(worker['name']).name!=worker['name']:continue
     name=worker['name'];work=run/name;runtime=work/'.runtime';state=read(runtime/'state.json')
     effective={**worker,**state.get('worker_control',{}).get('settings',{})}
+    keys,selected_key=worker_key_inventory(run,worker,state,controller_env,profile_env)
+    for key in keys:inventory[(key['id'],key['name'])]=key
     held=[];job_live=False
     for path in (runtime/'gpu-jobs').glob('*.json'):
      job=read(path)
@@ -94,12 +215,13 @@ def collect(roots,host):
          'controller_revision':label(ctl.get('code_revision')),'upgrade_pending':(run/'controller-upgrade.json').exists(),
          'provider_revision':number(state.get('providers',{}).get('revision')),
          'handle':handle,'sampled_at':now,'error':error(state),
-         'last_platform_receipt':None,'last_interaction':None}
+         'last_platform_receipt':None,'last_interaction':None,'provider_key_id':selected_key['id'] if selected_key else None,
+         'provider_key_source':selected_key['source'] if selected_key else None}
     # Operator-maintained reason metadata is explicitly required; PAUSE alone is not evidence of owner intent.
     reason=read(runtime/'operator-pause.json')
     row['intentional_stop']=bool(status in ('paused','stopped') and reason.get('owner_authorized') is True and reason.get('message_id'))
     rows.append(row)
- return {'host':host,'sampled_at':now,'workers':rows,'errors':failures}
+ return {'host':host,'sampled_at':now,'workers':rows,'errors':failures,'provider_keys':list(inventory.values())}
 
 
 if __name__=='__main__':

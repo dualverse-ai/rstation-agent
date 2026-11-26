@@ -136,3 +136,100 @@ def test_absent_family_is_unknown_and_future_response_is_not_evidence():
  assert all(f['status']=='unknown' for f in family_summary([],20000))
  w=row(last_response=21000);w['health']='working'
  assert family_summary([w],20000)[0]['status']=='no_recent_response'
+
+
+def test_key_identity_never_exports_values_or_url_secrets(tmp_path,monkeypatch):
+ import fleet_collect as f
+ root=tmp_path/'kit';run=root/'agent_data/run';rt=run/'gemini_1/.runtime';rt.mkdir(parents=True)
+ (run/'run.json').write_text(json.dumps({'workers':[{'name':'gemini_1','kind':'gemini','model':'carbon'}]}))
+ (run/'controller.json').write_text(json.dumps({'pid':100,'token':'controller'}))
+ (rt/'state.json').write_text(json.dumps({'status':'running','pid':101,'pid_token':'native','route_index':1,'started':19000,'last_response':19999}))
+ secret='DO_NOT_EXPORT_PRIMARY';backup='DO_NOT_EXPORT_BACKUP'
+ env={'RSTATION_WORKER_GEMINI_API_KEY':secret,'RSTATION_WORKER_GEMINI_BASE_URL':'https://relay.example/v1','RSTATION_WORKER_GEMINI_BACKUP_API_KEY':backup,'RSTATION_WORKER_GEMINI_BACKUP_BASE_URL':'https://user:PASS@backup.example/v1?key=QUERY_SECRET'}
+ monkeypatch.setattr(f,'process_provider_environment',lambda pid,token:env if pid==100 else {'GEMINI_API_KEY':backup,'GOOGLE_GEMINI_BASE_URL':env['RSTATION_WORKER_GEMINI_BACKUP_BASE_URL']})
+ result=f.collect([str(root)],'h6');encoded=json.dumps(result)
+ assert all(s not in encoded for s in [secret,backup,'PASS','QUERY_SECRET'])
+ keys=result['provider_keys'];assert len(keys)==2
+ assert result['workers'][0]['provider_key_id']==next(k['id'] for k in keys if k['route']==2)
+ assert next(k['endpoint'] for k in keys if k['route']==2)=='https://backup.example/v1'
+
+
+def test_key_url_only_exposes_known_path():
+ from fleet_collect import safe_endpoint
+ assert safe_endpoint('https://relay.example/key-SECRET')=='https://relay.example'
+ assert safe_endpoint('file:///private/key') is None
+ assert safe_endpoint('https://user:SECRET@relay.example:8443/v1?secret=HIDDEN')=='https://relay.example:8443/v1'
+
+
+def test_backup_success_does_not_make_primary_healthy():
+ from fleet_dashboard import key_observation
+ w=row(provider_key_id='backup',started_at=19800,last_response=19999)
+ assert key_observation('primary',[w],20000)['status']=='unknown'
+ assert key_observation('backup',[w],20000)['status']=='working'
+ w['started_at']=20000
+ assert key_observation('backup',[w],20000)['status']=='unknown'
+
+
+def test_provider_errors_and_mixed_results_are_not_hidden():
+ from fleet_dashboard import key_observation
+ failed=row(provider_key_id='key',started_at=19900,last_response=18000,state='retrying',error={'http_status':429})
+ ok=row(id='other',provider_key_id='key',started_at=19900,last_response=19990)
+ assert key_observation('key',[failed],20000)['status']=='errors'
+ assert key_observation('key',[failed,ok],20000)['status']=='mixed'
+ failed['intentional_stop']=True
+ assert key_observation('key',[failed],20000)['status']=='unknown'
+ ok['sampled_at']=19000
+ assert key_observation('key',[ok],20000)['status']=='unknown'
+
+
+def test_key_history_preserves_success_after_switch_and_has_gaps(tmp_path):
+ store=Store(tmp_path/'db');key={'id':'key','name':'Gemini primary','endpoint':'https://relay.example','family':'gemini','route':1,'source':'controller configuration'}
+ store.record({'host':'h4','sampled_at':20000,'provider_keys':[key],'workers':[row(provider_key_id='key',last_response=19999)]})
+ store.record({'host':'h4','sampled_at':20120,'provider_keys':[key],'workers':[row(provider_key_id='backup',sampled_at=20120,started_at=20100,last_response=20119)]})
+ k=store.view(20120)['provider_keys'][0]
+ assert k['last_response']==19999 and k['status']=='working' and k['workers']==0
+ assert any(v is None for v in k['history'])
+ assert store.view(20421)['provider_keys'][0]['status']=='unknown'
+
+
+def test_concurrent_key_inventory_writes(tmp_path):
+ store=Store(tmp_path/'db');errors=[]
+ def write(host):
+  try:
+   for n in range(12):
+    key={'id':'same','name':'Claude primary','endpoint':'https://relay.example','family':'claude'}
+    store.record({'host':host,'sampled_at':20000+n,'provider_keys':[key],'workers':[row(id=host,host=host,family='claude',provider_key_id='same',sampled_at=20000+n)]})
+  except Exception as e:errors.append(e)
+ threads=[threading.Thread(target=write,args=(host,)) for host in ['h4','h6']]
+ for t in threads:t.start()
+ for _ in range(15):store.view(20020)
+ for t in threads:t.join()
+ assert not errors
+ keys=store.view(20020)['provider_keys'];assert len(keys)==1 and keys[0]['hosts']==['h4','h6']
+
+
+@pytest.fixture(autouse=True)
+def no_live_profile_reads_in_tests(monkeypatch):
+ import fleet_collect as f
+ monkeypatch.setattr(f,'profile_environment',lambda root:{})
+
+
+def test_unreadable_process_profile_needs_matching_saved_fingerprint(tmp_path,monkeypatch):
+ import fleet_collect as f
+ monkeypatch.setattr(f,'process_provider_environment',lambda *args:{})
+ worker={'name':'gemini_1','kind':'gemini'}
+ env={'GEMINI_API_KEY':'FIXTURE_KEY','GEMINI_BASE_URL':'https://relay.example'}
+ state={'route_index':0,'providers':{'pool_sha256':'mismatch'}}
+ keys,selected=f.worker_key_inventory(tmp_path,worker,state,{},env)
+ assert len(keys)==1 and selected is None
+ state['providers']['pool_sha256']=f.pool_fingerprint(f.configured_pool(env,'gemini'),env,'gemini')
+ keys,selected=f.worker_key_inventory(tmp_path,worker,state,{},env)
+ assert selected['id']==keys[0]['id'] and selected['source']=='matching saved route fingerprint'
+
+
+def test_unknown_host_does_not_erase_observed_key_success(tmp_path):
+ store=Store(tmp_path/'db');key={'id':'shared','name':'Codex primary','endpoint':'https://relay.example','family':'codex'}
+ store.record({'host':'h4','sampled_at':20000,'provider_keys':[key],'workers':[row(provider_key_id='shared',last_response=19999)]})
+ store.record({'host':'h6','sampled_at':20001,'provider_keys':[key],'workers':[]})
+ result=store.view(20001)['provider_keys'][0]
+ assert result['status']=='working' and result['history'][-1]=='working'
