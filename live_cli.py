@@ -138,7 +138,9 @@ class LiveCLI:
         work = Path(self.args.workspace)
         config, worker = self.run_config()
         if not self.is_supervisor and config.get('role') != 'supervisor' and worker and worker.get('kind') == 'codex':
-            return worker.get('model') or self.args.model
+            from worker_control import effective_worker
+            state = read(work / '.runtime/state.json', {})
+            return effective_worker(worker, state).get('model') or self.args.model
         return self.args.model
 
     def send(self, text, number=None):
@@ -371,7 +373,9 @@ class LiveCLI:
                         if self.args.kind == 'codex': self.codex_event(event)
                         else: self.stream_event(event)
                 if self.args.kind in {'claude', 'gemini'}:
-                    waiting = self.is_supervisor and not self.busy and not self.continue_ready()
+                    from worker_control import checkpoint_requested
+                    waiting = not self.busy and (checkpoint_requested(self.args.workspace) or
+                              self.is_supervisor and not self.continue_ready())
                     recovery = self.watchdog.check(self.child.pid, waiting=waiting,
                                                    missing_replay=self.missing_replay_after_result)
                     if recovery:
@@ -385,6 +389,9 @@ class LiveCLI:
                                     raise RuntimeError('Native CLI stalled; resume saved conversation')
                             finally:
                                 os.kill(self.child.pid, signal.SIGCONT)
+                from worker_control import offer_checkpoint
+                if offer_checkpoint(self):
+                    continue
                 ready = self.args.kind != 'codex' or (self.thread is not None and (not self.busy or self.turn is not None))
                 # Long messages cannot block output, tools or the controller.
                 if ready and not self.output and not input_closed:

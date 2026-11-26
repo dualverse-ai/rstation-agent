@@ -122,6 +122,8 @@ class ClaudeResume(ClaudeCliWorkerBackend):
         except FileNotFoundError: pass
         return None
 
+from worker_control import serialize_failure
+
 class ResearchManager(CliJobManager):
     fresh_attempt_after_resume_exhaustion=True
     resume_reset_requires_tool_progress=True
@@ -152,7 +154,9 @@ class ResearchManager(CliJobManager):
     def _get_cli_job_backend(self,backend):
         if backend == "gemini":return AntigravityResume()
         return ClaudeResume(self.config.get("disable_web",False),self.config.get("subagents",0)) if backend=="claude" else super()._get_cli_job_backend(backend)
-    def worker(self,name):return next(w for w in self.config["workers"] if w["name"]==name)
+    def worker(self,name):
+        from worker_control import effective_worker
+        return effective_worker(next(w for w in self.config["workers"] if w["name"]==name), self.states.get(name, {}))
     def persist(self,name):
         save(self.run/name/".runtime/state.json",self.states[name])
     def log(self,name,text):
@@ -163,12 +167,18 @@ class ResearchManager(CliJobManager):
         line=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime())+" "+text+"\n"
         with (self.run/name/".runtime/console.log").open("a") as f:f.write(line)
     def _load_cli_job_state(self,name):
+        from worker_control import guard_launch
+        if not guard_launch(self,name):
+            s=self.states[name]
+            return CliJobState(self.worker(name)["kind"],s["spawn"],s["resumes"],2**31,14,s.get("token"),s.get("next",0),False,False)
         s=self.states[name]
         return CliJobState(self.worker(name)["kind"],s["spawn"],s["resumes"],2**31,14,s.get("token"),s.get("next",0),
                            not s.get("token") and time.time()>=s.get("next",0),bool(s.get("token")))
     def _format_cli_job_session_id(self,name,state,decision):
         return f"launch_{self.states[name]['launches']+1:06d}"
     def _claim_cli_job_launch(self,name,session_id,decision):
+        from worker_control import guard_launch
+        if not guard_launch(self,name):return None
         s=self.states[name]
         s.update(spawn=decision.spawn_count,resumes=decision.resume_count,launches=s["launches"]+1,
                  status="starting",route_count=decision.endpoint_resume_count or 0)
@@ -181,7 +191,11 @@ class ResearchManager(CliJobManager):
         # A small probe must never interrupt a productive backup conversation.
         index=(w.get("route_seed",0)+self.states[name].get("route_offset",0)+count//2)%len(self.route_lists[w["kind"]])
         recovery_route=self.states[name].pop("gemini_recovery_route",None)
-        if w["kind"]=="gemini" and recovery_route is not None:
+        from worker_control import selected_route
+        controlled=selected_route(self.states[name],None)
+        if controlled is not None:
+            index=controlled
+        elif w["kind"]=="gemini" and recovery_route is not None:
             index=recovery_route%len(self.route_lists["gemini"])
             self.states[name]["route_offset"]=index-w.get("route_seed",0)-count//2
         elif index and not self.probe and not self._untried_session_routes(name) and self._primary_recovered(name):
@@ -358,7 +372,7 @@ class ResearchManager(CliJobManager):
             prepared=replace(prepared,command=command,stdin_text=None)
         return prepared
     def _mark_cli_job_pid(self,name,pid):
-        self.states[name].update(pid=pid,pid_token=pid_token(pid),status="running",started=time.time())
+        self.states[name].update(pid=pid,pid_token=pid_token(pid),last_process_group=pid,status="running",started=time.time())
         self.persist(name)
     def _on_cli_job_process_exited(self,name,session,code):
         # A process can write its final events after the poll's first read.
@@ -386,7 +400,10 @@ class ResearchManager(CliJobManager):
                  pid=None,last_success=time.time(),route_count=0,route_offset=index-seed)
         self._endpoint_resume_counts[name]=0
         self.persist(name);self.log(name,"Turn completed; continuing research." if not self.probe else "Model connectivity check passed.")
+    @serialize_failure
     def _schedule_cli_job_resume(self,name,session,failure):
+        from worker_control import handle_failure
+        if handle_failure(self,name,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
         s=self.states[name]
@@ -435,7 +452,10 @@ class ResearchManager(CliJobManager):
                                  "Provider unavailable; retain the saved conversation.")
         return super()._classify_cli_job_failure(name,session)
 
+    @serialize_failure
     def _schedule_cli_job_fresh_attempt(self,name,session,failure):
+        from worker_control import handle_failure
+        if handle_failure(self,name,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
         s=self.states[name]
@@ -467,6 +487,7 @@ class ResearchManager(CliJobManager):
     def _session_recovery_protected(self,name,session):
         """A terminal CLI may still own orphaned tools or background jobs."""
         work=self.run/name
+        if self.states[name].get("worker_control"):return True
         if (self.run/"STOP").exists() or (work/".runtime/PAUSE").exists():return True
         from supervision import sleeping
         if sleeping(work):return True

@@ -234,6 +234,9 @@ def controller(run,keep_experiments=False):
                         for w in config['workers']:manager.log(w['name'],capability+' unavailable: '+error)
                     last_watchdog_check=time.time()
                 manager.poll_cli_jobs()
+                if any((run/w["name"]/".runtime/worker-control-request.json").exists() for w in config["workers"]):
+                    from worker_control import process_requests
+                    process_requests(manager)
                 try:manager.check_storage()
                 except OSError as exc:
                     # Advisory storage files must not stop unrelated researchers.
@@ -382,6 +385,11 @@ def parser():
 def main(argv=None):
     os.umask(0o077)
     argv=list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0]=='worker':
+        from worker_control import cli
+        try: cli(argv[1:])
+        except (ValueError, OSError) as exc: raise SystemExit(str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
+        return
     if argv and argv[0]=='restart-timer':
         from restart_timer import cli
         try: cli(argv[1:])
@@ -536,7 +544,8 @@ def main(argv=None):
             info=problem_info(config["url"],config["problem"],config.get("disable_web",False),config.get("platform_proxy"))
             config["category"]=info["category"]
             config["live_input"]=True
-            env=safe_environment();preflight(config,env)
+            from worker_control import preflight_resume
+            env=safe_environment();preflight_resume(run,config,env,preflight)
             save(run/"run.json",config);prepare_workspaces(run,config);start_controller(run,config,env,args.keep_experiments)
             from capabilities import ensure_services
             ensure_services(run,env)

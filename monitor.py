@@ -15,6 +15,8 @@ def snapshot(run):
     workers=[]
     for worker in config["workers"]:
         state=read(run/worker["name"]/".runtime/state.json",{})
+        from worker_control import effective_worker
+        worker=effective_worker(worker,state)
         live=alive(state.get("pid"),state.get("pid_token"))
         row={"worker":worker["name"],"model":worker["model"],"state":state.get("status","not started") if active else "stopped",
              "process_alive":live,"provider_route":state.get("route_index",0)+1,"retries":state.get("retry_total",0),
