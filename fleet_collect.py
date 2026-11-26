@@ -170,6 +170,7 @@ def collect(roots,host):
  now=time.time();rows=[];failures=[];inventory={}
  for root in roots:
   root=Path(root);data=root/'agent_data';profile_env=profile_environment(root)
+  key_labels=read(root/'.provider-labels.json').get('labels',{})
   if not data.is_dir():failures.append('missing_root');continue
   for config_path in sorted(data.glob('*/run.json')):
    run=config_path.parent;config=read(config_path);ctl=read(run/'controller.json')
@@ -180,7 +181,11 @@ def collect(roots,host):
     name=worker['name'];work=run/name;runtime=work/'.runtime';state=read(runtime/'state.json')
     effective={**worker,**state.get('worker_control',{}).get('settings',{})}
     keys,selected_key=worker_key_inventory(run,worker,state,controller_env,profile_env)
-    for key in keys:inventory[(key['id'],key['name'])]=key
+    for key in keys:
+     title=key_labels.get(key['id']) if isinstance(key_labels,dict) else None
+     if isinstance(title,str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.()/+-]{0,79}',title) and not title.startswith('sk-'):
+      key['label']=title
+     inventory[(key['id'],key['name'])]=key
     held=[];job_live=False
     for path in (runtime/'gpu-jobs').glob('*.json'):
      job=read(path)

@@ -233,3 +233,24 @@ def test_unknown_host_does_not_erase_observed_key_success(tmp_path):
  store.record({'host':'h6','sampled_at':20001,'provider_keys':[key],'workers':[]})
  result=store.view(20001)['provider_keys'][0]
  assert result['status']=='working' and result['history'][-1]=='working'
+
+
+def test_exact_internal_key_label_survives_collection_and_store(tmp_path,monkeypatch):
+ import fleet_collect as f
+ root=tmp_path/'kit';run=root/'agent_data/run';rt=run/'claude_1/.runtime';rt.mkdir(parents=True)
+ (run/'run.json').write_text(json.dumps({'workers':[{'name':'claude_1','kind':'claude'}]}))
+ (run/'controller.json').write_text(json.dumps({'pid':100,'token':'ctl'}))
+ env={'CLAUDE_API_KEY':'FIXTURE_SECRET','CLAUDE_BASE_URL':'https://relay.example'}
+ monkeypatch.setattr(f,'process_provider_environment',lambda pid,token:env if pid==100 else {})
+ ident=f.key_metadata('FIXTURE_SECRET','https://relay.example','claude',0,'test')['id']
+ labels=root/'.provider-labels.json'
+ labels.write_text(json.dumps({'labels':{ident:'research-claude-primary','unrelated':'wrong'}}))
+ first=f.collect([str(root)],'h4')
+ assert first['provider_keys'][0]['label']=='research-claude-primary'
+ assert 'FIXTURE_SECRET' not in json.dumps(first)
+ store=Store(tmp_path/'db');store.record(first)
+ assert store.view()['provider_keys'][0]['labels']==['research-claude-primary']
+ labels.write_text(json.dumps({'labels':{ident:'renamed-key'}}))
+ assert f.collect([str(root)],'h4')['provider_keys'][0]['label']=='renamed-key'
+ labels.write_text(json.dumps({'labels':{ident:'sk-secret-looking-value'}}))
+ assert 'label' not in f.collect([str(root)],'h4')['provider_keys'][0]

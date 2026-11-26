@@ -28,3 +28,6 @@ htmlcov/
 build/
 dist/
 node_modules/
+
+# Local display names keyed by opaque provider identity.
+.provider-labels.json
