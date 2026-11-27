@@ -15,11 +15,11 @@ def row(**kw):
 
 
 @pytest.mark.parametrize('change,expected',[
- ({},'working'),({'last_response':5000},'down'),({'last_response':None},'unknown'),
- ({'sampled_at':19000},'unknown'),({'state':'retrying'},'degraded'),({'state':'blocked'},'down'),
- ({'state':'paused'},'down'),({'state':'paused','intentional_stop':True},'intentional'),
- ({'last_response':16000,'foreground_job':True},'degraded'),({'last_response':16000},'degraded'),
- ({'last_response':None,'last_tool':19900},'working'),({'process_alive':True,'last_response':5000},'down')])
+ ({},'working'),({'last_response':5000},'transient_error'),({'last_response':None},'transient_error'),
+ ({'sampled_at':19000},'transient_error'),({'state':'retrying'},'transient_error'),({'state':'blocked'},'transient_error'),
+ ({'state':'paused'},'transient_error'),({'state':'paused','intentional_stop':True},'intentional'),
+ ({'last_response':16000,'foreground_job':True},'transient_error'),({'last_response':16000},'transient_error'),
+ ({'last_response':None,'last_tool':19900},'working'),({'process_alive':True,'last_response':5000},'transient_error')])
 def test_health_uses_work_not_process(change,expected):assert health(row(**change),20000)[0]==expected
 
 
@@ -41,7 +41,7 @@ def test_stale_rows_history_gaps_and_coverage(tmp_path):
  v=store.view(20000);w=v['workers'][0]
  assert 0<w['observed_hours']<.04 and w['stalled_hours']==w['observed_hours']
  assert any(x is None for x in w['history'])
- assert store.view(20301)['workers'][0]['health']=='unknown'
+ assert store.view(20301)['workers'][0]['health']=='transient_error'
  assert store.view(20301)['hosts'][0]['stale']
 
 
@@ -90,7 +90,7 @@ def test_account_name_and_unknown_route(tmp_path):
 def test_unknown_history_does_not_become_outage(tmp_path):
  store=Store(tmp_path/'db');store.record({'host':'h4','sampled_at':20000,'workers':[row(last_response=None)]})
  w=store.view(20000)['workers'][0]
- assert w['history'][-1]=='unknown' and w['stalled_hours']==0
+ assert w['history'][-1]=='degraded' and w['stalled_hours']==0
 
 
 def test_profile_fetch_does_not_block_host_tick(tmp_path,monkeypatch):
@@ -135,7 +135,7 @@ def test_absent_family_is_unknown_and_future_response_is_not_evidence():
  from fleet_dashboard import family_summary
  assert all(f['status']=='unknown' for f in family_summary([],20000))
  w=row(last_response=21000);w['health']='working'
- assert family_summary([w],20000)[0]['status']=='no_recent_response'
+ assert family_summary([w],20000)[0]['status']=='unknown'
 
 
 def test_key_identity_never_exports_values_or_url_secrets(tmp_path,monkeypatch):

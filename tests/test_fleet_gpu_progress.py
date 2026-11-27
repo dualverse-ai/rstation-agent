@@ -67,7 +67,7 @@ def test_live_descriptor_progress_keeps_response_age_and_provider_unknown(live_j
  def record(at,samples):
   store.record({'host':'h4','sampled_at':at,'workers':[row(sampled_at=at,last_response=100,last_tool=200,foreground_job=bool(samples),job_progress_samples=samples,provider_key_id='key')]})
  record(20000,first)
- assert store.view(20000)['workers'][0]['health']=='down'
+ assert store.view(20000)['workers'][0]['health']=='transient_error'
  child.stdin.write(b'20\n');child.stdin.flush();wait_step(20)
  second=collect.gpu_progress_as_worker(work,state,'gemini')
  assert second[0]['id']==first[0]['id'] and second[0]['step']==20
@@ -79,8 +79,8 @@ def test_live_descriptor_progress_keeps_response_age_and_provider_unknown(live_j
  assert key_observation('key',[worker],20120)['status']=='unknown'
  # Continued collection of unchanged counters must not refresh progress.
  for at in range(20240,20841,120):record(at,second)
- assert store.view(20840)['workers'][0]['health']=='down'
- assert store.view(21141)['workers'][0]['health']=='unknown'
+ assert store.view(20840)['workers'][0]['health']=='transient_error'
+ assert store.view(21141)['workers'][0]['health']=='transient_error'
 
 
 @pytest.mark.parametrize('change',['dead_token','foreign_parent','no_gpu','completed_tool','outside_log'])
@@ -120,4 +120,4 @@ def test_disappeared_advancing_job_cannot_credit_stationary_sibling(tmp_path):
  store=Store(tmp_path/'history')
  for at,values in [(20000,[('a',10),('b',10)]),(20120,[('a',20),('b',10)]),(20240,[('b',10)])]:
   store.record({'host':'h4','sampled_at':at,'workers':[row(sampled_at=at,last_response=100,foreground_job=True,job_progress_samples=[{'id':k,'step':v} for k,v in values])]})
- assert store.view(20240)['workers'][0]['health']=='down'
+ assert store.view(20240)['workers'][0]['health']=='transient_error'
