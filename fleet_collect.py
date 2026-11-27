@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import re
 import time
+import unicodedata
 
 STATES={'running','retrying','blocked','paused','stopped','continuing','starting','sleeping','not_started','unknown'}
 ERRORS={'provider_unavailable','model_refusal','session_unavailable','infra_transient','local_launch_error','route_selection_conflict','session_adoption_failed','worker_control_failed','provider_session_conflict'}
@@ -20,6 +21,17 @@ def read(path):
 
 
 def label(value):return value if isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_.:/@+-]{1,160}',value) else None
+
+def canonical_key_name(value):
+ # Inputs must already distinguish provider, token group and purpose with underscores.
+ if not isinstance(value,str) or len(value)>100 or value.count('_')<2:return None
+ if value.startswith(('RSTATION_','PERSONAL_','STATION_','CODEX_','CLAUDE_','GEMINI_','GOOGLE_')):return None
+ name=unicodedata.normalize('NFC',re.sub(r'[- ]+','_',value.casefold()))
+ parts=name.split('_')
+ if len(name)>100 or not re.fullmatch(r'[a-z0-9]+',parts[0]):return None
+ if any(not part or any(not (unicodedata.category(c).startswith('L') or unicodedata.category(c)=='Nd') for c in part) for part in parts[1:]):return None
+ return name
+
 
 def number(value):return value if type(value) in (int,float) and math.isfinite(value) and value>=0 else None
 
@@ -53,7 +65,7 @@ def error(state):
 def process_provider_environment(pid,token):
  """Inspect only an identified rStation process; secret values never leave the host."""
  if not alive(pid,token):return {}
- allowed={prefix+family+'_'+backup+field for prefix in ('','RSTATION_WORKER_') for family in ('CODEX','CLAUDE','GEMINI') for backup in ('','BACKUP_') for field in ('API_KEY','BASE_URL')}
+ allowed={prefix+family+'_'+backup+field for prefix in ('','RSTATION_WORKER_') for family in ('CODEX','CLAUDE','GEMINI') for backup in ('','BACKUP_') for field in ('API_KEY','BASE_URL','HTTP_PROXY','HTTPS_PROXY')}
  allowed.update(('ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','GOOGLE_GEMINI_BASE_URL'))
  try:
   raw=Path('/proc',str(int(pid)),'environ').read_bytes()
@@ -90,18 +102,22 @@ def key_metadata(key,endpoint,family,index,source):
 
 
 def configured_pool(env,family):
- prefix=family.upper()+'_'
- def value(field):return env.get(prefix+field,env.get('RSTATION_WORKER_'+prefix+field,''))
- primary=value('API_KEY');endpoint=value('BASE_URL')
- if not primary or not endpoint:return []
- pool=[{'api_key':primary,'base_url':endpoint}]
- backups=value('BACKUP_API_KEY').split(';') if value('BACKUP_API_KEY') else []
- urls=value('BACKUP_BASE_URL').split(';') if value('BACKUP_BASE_URL') else ['']*len(backups)
- if len(urls)==1 and len(backups)>1:urls*=len(backups)
- if len(backups)!=len(urls):return pool
- pool.extend({'api_key':key.strip(),'base_url':url.strip() or endpoint} for key,url in zip(backups,urls) if key.strip())
+ """Mirror deployed H4/H6/H7 routes(): dedicated fields only, no generic fallback."""
+ prefix='RSTATION_WORKER_'+family.upper()+'_'
+ def value(field):return env.get(prefix+field,'') or ''
+ fields=('api_key','base_url','http_proxy','https_proxy')
+ primary={f:value(f.upper()).strip() for f in fields}
+ if not primary['api_key'] or not primary['base_url']:return []
+ backups={f:[v.strip() for v in value('BACKUP_'+f.upper()).split(';')] if value('BACKUP_'+f.upper()) else [] for f in fields}
+ count=len(backups['api_key'])
+ if any(not k for k in backups['api_key']):return []
+ if any(v and len(v)!=count for v in backups.values()):return []
+ pool=[primary]
+ for i in range(count):
+  route={f:values[i] if values else '' for f,values in backups.items()}
+  route['base_url']=route['base_url'] or primary['base_url']
+  pool.append(route)
  return pool
-
 
 
 def profile_environment(root):
@@ -123,24 +139,16 @@ def profile_environment(root):
  return result
 
 
-def pool_fingerprint(pool,env,family):
- prefix=family.upper()+'_'
- def value(field):return env.get(prefix+field,env.get('RSTATION_WORKER_'+prefix+field,''))
- enriched=[]
- for i,route in enumerate(pool):
-  item=dict(route)
-  for field in ('HTTP_PROXY','HTTPS_PROXY'):
-   parts=value('BACKUP_'+field).split(';') if value('BACKUP_'+field) else []
-   item[field.lower()]=value(field) if i==0 else parts[i-1] if i<=len(parts) else ''
-  enriched.append(item)
- return hashlib.sha256(json.dumps(enriched,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+def pool_fingerprint(pool,env=None,family=None):
+ return hashlib.sha256(json.dumps(pool,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 def worker_key_inventory(run,worker,state,controller_env,profile_env=None):
  family=worker.get('kind');pool=configured_pool(controller_env,family) if family in ('codex','claude','gemini') else []
  registry=read(run/'.provider-control/providers.json');record=registry.get('workers',{}).get(worker['name'])
  source='controller configuration'
- verified=bool(pool)
- if not pool and profile_env:
+ expected=state.get('providers',{}).get('pool_sha256') or state.get('worker_control',{}).get('pool_sha256') or state.get('session_adoption',{}).get('provider_route',{}).get('pool_sha256')
+ verified=bool(pool) and (not expected or pool_fingerprint(pool)==expected)
+ if not controller_env and profile_env:
   pool=configured_pool(profile_env,family) if family in ('codex','claude','gemini') else []
   source='configured profile; connection unverified'
   expected=state.get('providers',{}).get('pool_sha256') or state.get('worker_control',{}).get('pool_sha256') or state.get('session_adoption',{}).get('provider_route',{}).get('pool_sha256')
@@ -151,6 +159,8 @@ def worker_key_inventory(run,worker,state,controller_env,profile_env=None):
   if revision==record.get('revision'):pool=record.get('after',[]);source='active provider revision';verified=True
   elif revision==record.get('before_revision'):pool=record.get('before',[]);source='active provider revision';verified=True
   else:pool=[];verified=False
+  pool=[{k:v for k,v in r.items() if k!='id'} for r in pool if isinstance(r,dict)]
+  if expected and pool_fingerprint(pool)!=expected:verified=False
  result=[]
  for i,r in enumerate(pool):
   if not isinstance(r,dict):continue
@@ -183,8 +193,8 @@ def collect(roots,host):
     keys,selected_key=worker_key_inventory(run,worker,state,controller_env,profile_env)
     for key in keys:
      title=key_labels.get(key['id']) if isinstance(key_labels,dict) else None
-     if isinstance(title,str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.()/+-]{0,79}',title) and not title.startswith('sk-'):
-      key['label']=title
+     canonical=canonical_key_name(title)
+     if canonical:key['label']=canonical
      inventory[(key['id'],key['name'])]=key
     held=[];job_live=False
     for path in (runtime/'gpu-jobs').glob('*.json'):

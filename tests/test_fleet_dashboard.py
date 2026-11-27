@@ -218,7 +218,7 @@ def test_unreadable_process_profile_needs_matching_saved_fingerprint(tmp_path,mo
  import fleet_collect as f
  monkeypatch.setattr(f,'process_provider_environment',lambda *args:{})
  worker={'name':'gemini_1','kind':'gemini'}
- env={'GEMINI_API_KEY':'FIXTURE_KEY','GEMINI_BASE_URL':'https://relay.example'}
+ env={'RSTATION_WORKER_GEMINI_API_KEY':'FIXTURE_KEY','RSTATION_WORKER_GEMINI_BASE_URL':'https://relay.example'}
  state={'route_index':0,'providers':{'pool_sha256':'mismatch'}}
  keys,selected=f.worker_key_inventory(tmp_path,worker,state,{},env)
  assert len(keys)==1 and selected is None
@@ -240,17 +240,131 @@ def test_exact_internal_key_label_survives_collection_and_store(tmp_path,monkeyp
  root=tmp_path/'kit';run=root/'agent_data/run';rt=run/'claude_1/.runtime';rt.mkdir(parents=True)
  (run/'run.json').write_text(json.dumps({'workers':[{'name':'claude_1','kind':'claude'}]}))
  (run/'controller.json').write_text(json.dumps({'pid':100,'token':'ctl'}))
- env={'CLAUDE_API_KEY':'FIXTURE_SECRET','CLAUDE_BASE_URL':'https://relay.example'}
+ env={'RSTATION_WORKER_CLAUDE_API_KEY':'FIXTURE_SECRET','RSTATION_WORKER_CLAUDE_BASE_URL':'https://relay.example'}
  monkeypatch.setattr(f,'process_provider_environment',lambda pid,token:env if pid==100 else {})
  ident=f.key_metadata('FIXTURE_SECRET','https://relay.example','claude',0,'test')['id']
  labels=root/'.provider-labels.json'
- labels.write_text(json.dumps({'labels':{ident:'research-claude-primary','unrelated':'wrong'}}))
+ labels.write_text(json.dumps({'labels':{ident:'ikun_claude_rstation','unrelated':'wrong'}}))
  first=f.collect([str(root)],'h4')
- assert first['provider_keys'][0]['label']=='research-claude-primary'
+ assert first['provider_keys'][0]['label']=='ikun_claude_rstation'
  assert 'FIXTURE_SECRET' not in json.dumps(first)
  store=Store(tmp_path/'db');store.record(first)
- assert store.view()['provider_keys'][0]['labels']==['research-claude-primary']
- labels.write_text(json.dumps({'labels':{ident:'renamed-key'}}))
- assert f.collect([str(root)],'h4')['provider_keys'][0]['label']=='renamed-key'
+ assert store.view()['provider_keys'][0]['labels']==['ikun_claude_rstation']
+ labels.write_text(json.dumps({'labels':{ident:'ikun_claude_rstation_2'}}))
+ assert f.collect([str(root)],'h4')['provider_keys'][0]['label']=='ikun_claude_rstation_2'
  labels.write_text(json.dumps({'labels':{ident:'sk-secret-looking-value'}}))
  assert 'label' not in f.collect([str(root)],'h4')['provider_keys'][0]
+
+
+@pytest.mark.parametrize('name',[None,'RSTATION_WORKER_GEMINI_API_KEY','Gemini primary','stephen-rstation-worker-gemini','aabbcc','sk-secret','ikun_gemini','https://provider.example'])
+def test_noncanonical_key_names_never_become_display_names(tmp_path,name):
+ store=Store(tmp_path/'db')
+ key={'id':'private-identity','name':'Gemini primary','label':name,'endpoint':'https://relay.example','family':'gemini'}
+ store.record({'host':'h4','sampled_at':20000,'provider_keys':[key],'workers':[]})
+ k=store.view(20001)['provider_keys'][0]
+ assert k['display_name'] is None and k['name_status']=='missing'
+
+
+def test_conflicting_canonical_names_do_not_pick_arbitrary_alias(tmp_path):
+ store=Store(tmp_path/'db')
+ for host,name in [('h4','ikun_gemini_rstation'),('h6','ikun_gemini_personal')]:
+  key={'id':'same','name':'Gemini primary','label':name,'endpoint':'https://relay.example','family':'gemini'}
+  store.record({'host':host,'sampled_at':20000,'provider_keys':[key],'workers':[]})
+ k=store.view(20001)['provider_keys'][0]
+ assert k['display_name'] is None and k['name_status']=='conflict'
+ key['label']='ikun_gemini_rstation'
+ store.record({'host':'h6','sampled_at':20002,'provider_keys':[key],'workers':[]})
+ k=store.view(20003)['provider_keys'][0]
+ assert k['display_name']=='ikun_gemini_rstation' and k['name_status']=='named'
+
+
+def test_numeric_provider_prefix_is_a_valid_canonical_name():
+ from fleet_collect import canonical_key_name
+ assert canonical_key_name('4router_gemini_council')=='4router_gemini_council'
+
+
+@pytest.mark.parametrize('family',['codex','claude','gemini'])
+@pytest.mark.parametrize('dedicated',['missing','','   ','DEDICATED'])
+def test_deployed_routes_ignore_conflicting_generic_fields(family,dedicated):
+ from fleet_collect import configured_pool
+ prefix=family.upper()+'_'
+ env={prefix+'API_KEY':'GENERIC',prefix+'BASE_URL':'https://generic.example',prefix+'BACKUP_API_KEY':'GENERIC_BACKUP'}
+ if dedicated!='missing':env['RSTATION_WORKER_'+prefix+'API_KEY']=dedicated
+ env['RSTATION_WORKER_'+prefix+'BASE_URL']='https://dedicated.example'
+ pool=configured_pool(env,family)
+ if dedicated!='DEDICATED':assert pool==[]
+ else:assert pool==[{'api_key':'DEDICATED','base_url':'https://dedicated.example','http_proxy':'','https_proxy':''}]
+
+
+def test_route_backups_and_proxy_fingerprint_match_launcher():
+ from fleet_collect import configured_pool,pool_fingerprint
+ env={'RSTATION_WORKER_CODEX_API_KEY':' MAIN ','RSTATION_WORKER_CODEX_BASE_URL':'https://main.example',
+      'RSTATION_WORKER_CODEX_BACKUP_API_KEY':' FIRST ; SECOND ',
+      'RSTATION_WORKER_CODEX_BACKUP_BASE_URL':';https://second.example',
+      'RSTATION_WORKER_CODEX_BACKUP_HTTP_PROXY':'http://proxy.example;',
+      'CODEX_BACKUP_HTTPS_PROXY':'https://wrong.example'}
+ pool=configured_pool(env,'codex')
+ assert pool[1]=={'api_key':'FIRST','base_url':'https://main.example','http_proxy':'http://proxy.example','https_proxy':''}
+ assert pool[2]=={'api_key':'SECOND','base_url':'https://second.example','http_proxy':'','https_proxy':''}
+ import hashlib
+ assert pool_fingerprint(pool)==hashlib.sha256(json.dumps(pool,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+ env['RSTATION_WORKER_CODEX_BACKUP_BASE_URL']='https://one.example'
+ assert configured_pool(env,'codex')==[]  # Launcher rejects count mismatch; no broadcast.
+
+
+@pytest.mark.parametrize('revision,expected_key',[(0,'OLD'),(1,'NEW'),(2,None)])
+def test_active_registry_revision_wins_over_controller_and_profile(tmp_path,monkeypatch,revision,expected_key):
+ import fleet_collect as f
+ monkeypatch.setattr(f,'process_provider_environment',lambda *args:{})
+ path=tmp_path/'.provider-control';path.mkdir()
+ def route(key):return {'id':'route-1','api_key':key,'base_url':'https://relay.example','http_proxy':'','https_proxy':''}
+ (path/'providers.json').write_text(json.dumps({'workers':{'codex_1':{'revision':1,'before_revision':0,'before':[route('OLD')],'after':[route('NEW')]}}}))
+ env={'RSTATION_WORKER_CODEX_API_KEY':'ENV','RSTATION_WORKER_CODEX_BASE_URL':'https://env.example','CODEX_API_KEY':'GENERIC','CODEX_BASE_URL':'https://generic.example'}
+ keys,selected=f.worker_key_inventory(tmp_path,{'name':'codex_1','kind':'codex'},{'route_index':0,'providers':{'revision':revision}},env,env)
+ if expected_key is None:assert keys==[] and selected is None
+ else:assert selected['id']==f.key_metadata(expected_key,'https://relay.example','codex',0,'test')['id']
+
+
+def test_known_empty_controller_environment_does_not_use_current_profile(tmp_path,monkeypatch):
+ import fleet_collect as f
+ monkeypatch.setattr(f,'process_provider_environment',lambda *args:{})
+ env={'RSTATION_WORKER_CODEX_API_KEY':'','CODEX_API_KEY':'GENERIC','CODEX_BASE_URL':'https://generic.example'}
+ profile={'RSTATION_WORKER_CODEX_API_KEY':'OTHER','RSTATION_WORKER_CODEX_BASE_URL':'https://other.example'}
+ keys,selected=f.worker_key_inventory(tmp_path,{'name':'codex_1','kind':'codex'},{'route_index':0},env,profile)
+ assert keys==[] and selected is None
+
+
+def test_corrected_inventory_removes_old_generic_identity_without_erasing_history(tmp_path):
+ store=Store(tmp_path/'db')
+ def key(ident):return {'id':ident,'name':'Codex primary','endpoint':'https://relay.example','family':'codex'}
+ store.record({'host':'h4','sampled_at':20000,'provider_keys':[key('generic')],'workers':[]})
+ store.record({'host':'h6','sampled_at':20000,'provider_keys':[key('other-host')],'workers':[]})
+ store.record({'host':'h4','sampled_at':20001,'provider_keys':[key('dedicated')],'workers':[]})
+ assert {k['id'] for k in store.view(20001)['provider_keys']}=={'dedicated','other-host'}
+ with store.connect() as con:assert con.execute("SELECT COUNT(*) FROM key_samples WHERE key_id='generic'").fetchone()[0]==1
+
+
+@pytest.mark.parametrize('raw,expected',[
+ ('IKUN_cc逆向_rStation','ikun_cc逆向_rstation'),
+ ('Ikun_Claude Code-稳定_rStation_2','ikun_claude_code_稳定_rstation_2'),
+ ('rightcode_gemini_expensive_personal','rightcode_gemini_expensive_personal'),
+ ('4router_gemini_council','4router_gemini_council'),
+])
+def test_actual_token_group_names_normalize_and_survive_store(tmp_path,raw,expected):
+ from fleet_collect import canonical_key_name
+ assert canonical_key_name(raw)==expected
+ store=Store(tmp_path/'db')
+ key={'id':'identity','name':'Claude primary','label':raw,'endpoint':'https://relay.example','family':'claude'}
+ store.record({'host':'h4','sampled_at':20000,'provider_keys':[key],'workers':[]})
+ assert store.view(20001)['provider_keys'][0]['display_name']==expected
+
+
+@pytest.mark.parametrize('value',[
+ 'ikun_cc逆向_rstation\n','ikun_cc逆向_rstation\t','ikun_cc逆向_rstation\u200b',
+ 'ikun_cc逆向_<script>','ikun_cc逆向_rstation/2','ikun__rstation','_ikun_cc逆向_rstation',
+ 'ikun_cc逆向_rstation_','ikun_cc逆向_rstation\u202e','ikun_🙂_rstation',
+ 'ikun_cc逆向_'+'a'*100,'stephen-rstation-worker-claude',
+])
+def test_whole_token_group_name_rejects_hidden_or_unsafe_content(value):
+ from fleet_collect import canonical_key_name
+ assert canonical_key_name(value) is None

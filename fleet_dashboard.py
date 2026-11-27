@@ -14,7 +14,7 @@ import time
 import urllib.request
 from urllib.parse import urlsplit,quote
 
-from fleet_collect import label,number,stamp
+from fleet_collect import label,number,stamp,canonical_key_name
 ROOT=Path(__file__).resolve().parent
 ORDER={'down':0,'degraded':1,'unknown':2,'working':3,'intentional':4}
 
@@ -94,6 +94,8 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     state,reason=health(row,now);row=dict(row,health=state,health_reason=reason)
     con.execute('INSERT OR REPLACE INTO current VALUES(?,?)',(row['id'],json.dumps(row)))
     con.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?)',(row['id'],now,state,row.get('last_response'),row.get('last_tool'),len(row.get('gpu',[]))))
+   if 'provider_keys' in snapshot and not snapshot.get('errors'):
+    con.execute('DELETE FROM key_inventory WHERE host=?',(snapshot['host'],))
    for key in snapshot.get('provider_keys',[]):
     con.execute('INSERT OR REPLACE INTO key_inventory VALUES(?,?,?,?,?)',(snapshot['host'],key['id'],key['name'],now,json.dumps(key)))
    for ident in {k['id'] for k in snapshot.get('provider_keys',[])}:
@@ -151,10 +153,13 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
    info=json.loads(body)
    k=keys.setdefault(ident,{'id':ident,'names':set(),'labels':set(),'endpoint':info['endpoint'],'hosts':set(),'families':set(),'sampled_at':0})
    k['names'].add(name)
-   if info.get('label'):k['labels'].add(info['label'])
+   canonical=canonical_key_name(info.get('label'))
+   if canonical:k['labels'].add(canonical)
    k['hosts'].add(host);k['families'].add(info['family']);k['sampled_at']=max(k['sampled_at'],at)
   for ident,k in keys.items():
    k.update(key_observation(ident,rows,now));k['names']=sorted(k['names']);k['labels']=sorted(k['labels']);k['hosts']=sorted(k['hosts']);k['families']=sorted(k['families']);k['history']=[None]*18
+   k['display_name']=k['labels'][0] if len(k['labels'])==1 else None
+   k['name_status']='named' if len(k['labels'])==1 else 'conflict' if k['labels'] else 'missing'
    k['last_response']=max(k['last_response'] or 0,key_responses.get(ident) or 0) or None
    if now-k['sampled_at']>300:k['status']='unknown'
    elif k['status']=='unknown' and k['last_response'] and 0<=now-k['last_response']<=600:k['status']='working'
