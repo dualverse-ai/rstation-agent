@@ -72,3 +72,5 @@ The command checks every proposed route with each affected researcher's effectiv
 Each researcher loads the validated list on its next native client launch, without reloading the controller or stopping an active client, tool or GPU job. A long-running client keeps its current credentials until it next launches. Status distinguishes a validated request from an applied revision. Paused researchers remain paused. Saved conversations, context budgets, workspaces and messages remain intact. A provider update does not clear a refusal or other existing worker block.
 
 The launcher stores the validated routes in private operator storage under the run, separate from worker state and receipts. Restarted controllers recover the active provider revision from that storage. Editing a shell profile alone does not change running clients. Updates cover the named research workers; coder and council provider settings remain separate.
+
+For original or verified relayed owner instructions, use [owner message history](owner-messages.md) to record received messages for later reference.

@@ -352,6 +352,8 @@ def parser():
     send.add_argument("name");send.add_argument("worker",help="Worker name, or all.")
     send.add_argument("text",nargs="?")
     send.add_argument("--file",type=Path,help="Read the message from a text file.")
+    send.add_argument('--owner',action='store_true',help='Explicitly identify an original or verified relayed owner instruction.')
+    send.add_argument('--owner-reference',help='Owner instruction reference, such as desk:6:13328; requires --owner.')
     messages=sub.add_parser("messages",help="Show operator message delivery status.")
     messages.add_argument("name");messages.add_argument("worker",nargs="?",default="all")
     council=sub.add_parser('council',help='Configure optional research council consultations.')
@@ -518,8 +520,10 @@ def main(argv=None):
                 if not text.strip():raise ValueError("The message is empty.")
                 if not config.get("live_input",False):
                     raise ValueError("Resume this run with the updated toolkit to enable CLI messages.")
+                if args.owner != bool(args.owner_reference):
+                    raise ValueError('Use --owner and --owner-reference together.')
                 for w in workers:
-                    number=Messages(run/w["name"]).add(text)
+                    number=Messages(run/w["name"]).add(text, owner_reference=args.owner_reference)
                     print(f"{w['name']}: message {number} queued. Check with agents messages {args.name} {w['name']}.")
             else:
                 for w in workers:

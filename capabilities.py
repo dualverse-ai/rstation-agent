@@ -40,6 +40,8 @@ def install_skills(run,config,worker):
             for alias in aliases:
                 if alias.is_symlink() and alias.resolve()==canonical.parent.resolve():alias.unlink()
             canonical.unlink(missing_ok=True)
+    from owner_history import sync
+    sync(work, install_pointer=True)
     if config.get('role')=='supervisor':return
     from common import researcher_instructions
     instruction_start='<!-- rstation research instructions -->'

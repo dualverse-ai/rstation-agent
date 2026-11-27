@@ -26,19 +26,30 @@ class Messages:
             data = read(self.path, {'next': 1, 'messages': []})
             result = action(data)
             save(self.path, data, owner=owner)
+            if any(m.get('owner_message') for m in data['messages']) or (self.path.parent / 'owner_history.json').exists():
+                from owner_history import sync_safely
+                sync_safely(self.path.parent.parent, data, owner)
             return result
 
-    def add(self, text, *, source=None, delivery_key=None, priority=None):
+    def add(self, text, *, source=None, delivery_key=None, priority=None, owner_reference=None):
         if not text.strip():
             raise ValueError('The message is empty.')
+        owner_message = None
+        if owner_reference is not None:
+            from owner_history import provenance
+            owner_message = provenance(owner_reference)
         def add(data):
             if delivery_key:
                 existing = next((m for m in data['messages'] if m.get('delivery_key') == delivery_key), None)
                 if existing:
+                    if owner_message is not None and (existing.get('owner_message') != owner_message or existing['text'] != text):
+                        raise ValueError('Duplicate owner delivery conflicts with the recorded message.')
                     return existing['id']
             number = data['next']
             data['next'] += 1
-            data['messages'].append(dict(id=number, text=text.strip(), status='queued', queued_at=now()))
+            data['messages'].append(dict(id=number, text=text if owner_message else text.strip(), status='queued', queued_at=now()))
+            if owner_message is not None:
+                data['messages'][-1]['owner_message'] = owner_message
             if source:
                 data['messages'][-1]['source'] = source
             if delivery_key:
