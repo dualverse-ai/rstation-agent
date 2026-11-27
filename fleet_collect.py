@@ -176,6 +176,144 @@ def worker_key_inventory(run,worker,state,controller_env,profile_env=None):
  return result,selected
 
 
+def process_info(pid):
+ try:
+  fields=Path('/proc',str(int(pid)),'stat').read_text().rsplit(')',1)[1].split()
+  if fields[0] in ('Z','X'):return None
+  return {'parent':int(fields[1]),'token':fields[19]}
+ except (OSError,ValueError,IndexError):return None
+
+
+def pending_command(runtime,state,kind):
+ """Only an unfinished native tool can make a GPU job foreground evidence."""
+ launch=state.get('launches')
+ if type(launch)!=int or launch<0:return None
+ try:
+  with (runtime/f'launch_{launch:06d}'/'transcript.jsonl').open('rb') as f:
+   size=f.seek(0,2);f.seek(max(0,size-2*1024*1024))
+   if size>2*1024*1024:f.readline()  # A partial record is not evidence.
+   lines=f.read(2*1024*1024).splitlines()
+ except OSError:return None
+ pending=set()
+ for line in lines:
+  try:e=json.loads(line)
+  except ValueError:continue
+  if not isinstance(e,dict):continue
+  if kind=='gemini':
+   step=e.get('step_update',{})
+   if isinstance(step,dict) and step.get('step_type')=='tool':
+    key=step.get('step_index')
+    if type(key)!=int:continue
+    if step.get('state') in ('DONE','ERROR','FAILED','CANCELLED'):pending.discard(key)
+    elif step.get('state') in ('ACTIVE','RUNNING','IN_PROGRESS'):pending.add(key)
+   if e.get('event')=='result':pending.clear()
+  elif kind=='codex':
+   item=e.get('item',{})
+   if isinstance(item,dict) and isinstance(item.get('id'),str):
+    if e.get('type')=='item.completed':pending.discard(item['id'])
+    elif e.get('type')=='item.started' and item.get('type')=='command_execution':pending.add(item['id'])
+   if e.get('type') in ('turn.completed','turn.failed'):pending.clear()
+  elif kind=='claude':
+   message=e.get('message',{});content=message.get('content',[]) if isinstance(message,dict) else []
+   if isinstance(content,list):
+    for part in content:
+     if not isinstance(part,dict):continue
+     if part.get('type')=='tool_use' and part.get('name') in ('Bash','bash') and isinstance(part.get('id'),str):pending.add(part['id'])
+     elif part.get('type')=='tool_result':pending.discard(part.get('tool_use_id'))
+   if e.get('type')=='result':pending.clear()
+ return hashlib.sha256(json.dumps(sorted(pending)).encode()).hexdigest() if pending else None
+
+
+def training_step(data):
+ # Export counters only, never arbitrary log text or file names. Heartbeats,
+ # percentages, loss values and byte growth are not training-step evidence.
+ matches=list(re.finditer(rb'(?mi)^\s*step\s*[=: ]\s*(\d{1,12})(?:\s*/\s*\d{1,12})?(?=\s|$)',data))
+ return int(matches[-1][1]) if matches else None
+
+
+def gpu_progress_as_worker(work,state,kind):
+ import os,stat
+ runtime=work/'.runtime';tool=pending_command(runtime,state,kind)
+ root=state.get('pid');token=state.get('pid_token')
+ if not tool or not alive(root,token):return []
+ jobs=[]
+ for path in list((runtime/'gpu-jobs').glob('*.json'))[:128]:
+  job=read(path)
+  if (job.get('gpus') and alive(job.get('helper_pid'),job.get('helper_token'))
+      and alive(job.get('pid'),job.get('token'))):jobs.append(job)
+ if not jobs:return []
+ table={int(p.name):info for p in Path('/proc').iterdir() if p.name.isdigit() and (info:=process_info(p.name))}
+ def beneath(pid,parent):
+  seen=set()
+  while pid in table and pid not in seen:
+   if pid==parent:return True
+   seen.add(pid);pid=table[pid]['parent']
+  return False
+ result=[];seen=set();work=work.resolve()
+ for job in jobs:
+  driver=job['pid'];helper=job['helper_pid']
+  if (not beneath(helper,root) or not beneath(driver,helper)
+      or table.get(driver,{}).get('token')!=str(job['token'])
+      or table.get(helper,{}).get('token')!=str(job['helper_token'])):continue
+  descendants=[pid for pid in table if beneath(pid,driver)][:128]
+  for pid in descendants:
+   for fd in list(Path('/proc',str(pid),'fd').glob('*'))[:256]:
+    try:
+     target=fd.resolve(strict=True);relative=target.relative_to(work)
+     if target.suffix not in ('.log','.out','.txt') or any(p.startswith('.') for p in relative.parts):continue
+     flags=re.search(r'^flags:\s*([0-7]+)$',fd.with_name(fd.name).parent.parent.joinpath('fdinfo',fd.name).read_text(),re.M)
+     if not flags or int(flags[1],8)&os.O_ACCMODE not in (os.O_WRONLY,os.O_RDWR):continue
+     expected=target.stat()
+     # Opening a raced descriptor must never block on a pipe or device.
+     handle=os.open(fd,os.O_RDONLY|os.O_NONBLOCK)
+     with os.fdopen(handle,'rb') as f:
+      info=os.fstat(f.fileno())
+      if not stat.S_ISREG(info.st_mode) or (info.st_dev,info.st_ino)!=(expected.st_dev,expected.st_ino) or (info.st_dev,info.st_ino) in seen:continue
+      seen.add((info.st_dev,info.st_ino))
+      f.seek(max(0,info.st_size-65536))
+      if info.st_size>65536:f.readline()
+      data=f.read(65536)
+     step=training_step(data)
+     if step is None:continue
+     if not alive(pid,table[pid]['token']) or not alive(driver,job['token']) or not alive(root,token):continue
+     identity=[root,str(token),state['launches'],tool,driver,str(job['token']),info.st_dev,info.st_ino]
+     result.append({'id':hashlib.sha256(json.dumps(identity).encode()).hexdigest(),'step':step})
+    except (OSError,ValueError):continue
+ return result[:64]
+
+
+def gpu_progress(work,state,kind):
+ """Read /proc as the workspace account, without changing worker permissions."""
+ import os,select,signal
+ try:owner=work.stat()
+ except OSError:return []
+ if os.geteuid()!=0 or owner.st_uid==0:return gpu_progress_as_worker(work,state,kind)
+ # Hosts can deny root access to a worker's descriptor links. This disposable
+ # collector child drops privilege; no worker process receives a signal.
+ read_fd,write_fd=os.pipe();child=os.fork()
+ if child==0:
+  os.close(read_fd)
+  try:
+   os.setgroups([]);os.setgid(owner.st_gid);os.setuid(owner.st_uid)
+   data=json.dumps(gpu_progress_as_worker(work,state,kind)).encode()
+   os.write(write_fd,data[:16384])
+  except Exception:pass
+  finally:os.close(write_fd);os._exit(0)
+ os.close(write_fd)
+ try:
+  if not select.select([read_fd],[],[],5)[0]:
+   os.kill(child,signal.SIGKILL);return []
+  data=b''
+  while chunk:=os.read(read_fd,16384):
+   data+=chunk
+   if len(data)>16384:return []
+  result=json.loads(data)
+  return result if isinstance(result,list) else []
+ except (OSError,ValueError):return []
+ finally:
+  os.close(read_fd);os.waitpid(child,0)
+
+
 def collect(roots,host):
  now=time.time();rows=[];failures=[];inventory={}
  for root in roots:
@@ -201,6 +339,7 @@ def collect(roots,host):
      job=read(path)
      if alive(job.get('helper_pid'),job.get('helper_token')) or alive(job.get('pid'),job.get('token')):
       job_live=True;held.extend(g for g in job.get('gpus',[]) if type(g)==int and 0<=g<100)
+    progress_samples=gpu_progress(work,state,worker.get('kind')) if job_live else []
     messages=read(runtime/'operator_messages.json').get('messages',[])
     messages=[m for m in messages if isinstance(m,dict)] if isinstance(messages,list) else []
     pending=sum(m.get('status') in ('queued','sent') for m in messages)
@@ -220,7 +359,8 @@ def collect(roots,host):
          'role':'supervisor' if config.get('role')=='supervisor' else 'researcher','model':label(effective.get('model')),
          'family':worker.get('kind') if worker.get('kind') in ('codex','claude','gemini') else 'unknown',
          'route':(state['route_index']+1) if type(state.get('route_index'))==int else None,
-         'state':status,'controller_alive':ctl_live,'process_alive':native_live,'foreground_job':False,'owned_job':job_live,
+         'state':status,'controller_alive':ctl_live,'process_alive':native_live,'foreground_job':bool(progress_samples),'owned_job':job_live,
+         'job_progress_samples':progress_samples,
          'last_response':number(state.get('last_response')),'last_tool':number(state.get('last_tool_completed')),
          'last_success':number(state.get('last_success')),'started_at':number(state.get('started')),
          'context_tokens':number(config.get('gemini_context_tokens')) if worker.get('kind')=='gemini' else None,

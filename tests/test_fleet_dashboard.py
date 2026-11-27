@@ -18,7 +18,7 @@ def row(**kw):
  ({},'working'),({'last_response':5000},'down'),({'last_response':None},'unknown'),
  ({'sampled_at':19000},'unknown'),({'state':'retrying'},'degraded'),({'state':'blocked'},'down'),
  ({'state':'paused'},'down'),({'state':'paused','intentional_stop':True},'intentional'),
- ({'last_response':16000,'foreground_job':True},'working'),({'last_response':16000},'degraded'),
+ ({'last_response':16000,'foreground_job':True},'degraded'),({'last_response':16000},'degraded'),
  ({'last_response':None,'last_tool':19900},'working'),({'process_alive':True,'last_response':5000},'down')])
 def test_health_uses_work_not_process(change,expected):assert health(row(**change),20000)[0]==expected
 

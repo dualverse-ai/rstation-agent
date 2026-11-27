@@ -16,7 +16,7 @@ Field sources:
 
 - Run/model/route/state: run.json and runtime state; per-worker effective model overrides are included.
 - Real response/completed tool: native activity timestamps recorded by the launcher.
-- GPU: live owned GPU helper/job receipts. These do not establish that a job is foreground, so job presence alone never upgrades health to green; disk: most recent recorded workspace size and allowance.
+- GPU: live owned GPU helper/job receipts. Job presence alone never establishes progress. An unfinished native tool, a verified descendant GPU job and an open workspace log with increasing training-step counters across two samples establish advancing work. The worker stays Working while that same foreground job has advanced within ten minutes; frozen counters, vanished jobs and stale host samples lose that evidence. Native response age and provider health remain independent. The collector inspects descriptor links as the workspace account and exports no log paths or contents. Disk: most recent recorded workspace size and allowance.
 - Owner messages: queue status and recorded owner receipt time; message bodies are excluded.
 - Handle: known account-file fields; registration and published-paper counts: public profile APIs.
 - Last public activity: public posts/comments/papers. This is NOT the complete interaction time. Full platform interaction and local platform receipt remain Unknown where no trustworthy structured source is available.

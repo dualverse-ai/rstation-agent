@@ -25,14 +25,32 @@ def health(row,now):
  state=row.get('state')
  if state=='blocked':return 'down','Controller reports a block'
  progress=max(row.get('last_response') or 0,row.get('last_tool') or 0)
- if not progress:return 'unknown','No response or completed-tool timestamp'
  if state in ('stopped','paused'):return 'down','Stopped without a verified owner reason'
+ job=row.get('last_job_progress')
+ if state!='retrying' and row.get('foreground_job') and job and 0<=now-job<=600:return 'working','GPU experiment is advancing'
+ if not progress:return 'unknown','No response or completed-tool timestamp'
  age=now-progress
  if age>10800:return 'down','No real response or completed tool for more than 3 hours'
  if state=='retrying':return 'degraded','Retrying after a failed request'
  if age<=1800:return 'working','Recent response or completed tool'
- if row.get('foreground_job') and now-(row.get('last_response') or 0)<=10800:return 'working','Owned foreground job and recent response'
  return 'degraded','No response or completed tool for 30 minutes'
+
+
+def with_job_progress(row,previous,now):
+ """Require two fresh observations of the same live job, tool and output file."""
+ def samples(values):
+  return {v['id']:v for v in values if isinstance(v,dict) and isinstance(v.get('id'),str) and type(v.get('step'))==int and v['step']>=0}
+ current=samples(row.get('job_progress_samples',[]));old=samples(previous.get('job_progress_samples',[]))
+ fresh=0<now-previous.get('sampled_at',0)<=300
+ entries=[]
+ for key,value in current.items():
+  last=None
+  if row.get('foreground_job') and fresh and key in old:
+   if value['step']>old[key]['step']:last=now
+   elif value['step']==old[key]['step']:last=old[key].get('advanced_at')
+  entries.append({'id':key,'step':value['step'],'advanced_at':last})
+ return dict(row,job_progress_samples=entries,last_job_progress=max((e['advanced_at'] for e in entries if e['advanced_at']),default=None))
+
 
 
 def family_summary(rows, now):
@@ -91,6 +109,8 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
   with self.connect() as con:
    con.execute('INSERT OR REPLACE INTO hosts VALUES(?,?,?)',(snapshot['host'],now,';'.join(snapshot.get('errors',[])) or None))
    for row in snapshot['workers']:
+    previous=con.execute('SELECT body FROM current WHERE worker=?',(row['id'],)).fetchone()
+    row=with_job_progress(row,json.loads(previous[0]) if previous else {},now)
     state,reason=health(row,now);row=dict(row,health=state,health_reason=reason)
     con.execute('INSERT OR REPLACE INTO current VALUES(?,?)',(row['id'],json.dumps(row)))
     con.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?)',(row['id'],now,state,row.get('last_response'),row.get('last_tool'),len(row.get('gpu',[]))))
@@ -121,6 +141,7 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     samples.setdefault(worker,[]).append((at,state,response,tool,gpus))
   counts={k:0 for k in ORDER};providers={}
   for row in rows:
+   row.pop('job_progress_samples',None)
    row['health'],row['health_reason']=health(row,now);counts[row['health']]+=1
    entries=samples.get(row['id'],[]);history=[None]*168;observed=lost=gpu_hours=0
    for i,(at,state,response,tool,gpus) in enumerate(entries):
@@ -128,7 +149,7 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     if 0<=index<168:
      # Green requires actual work in this hour, not merely an alive process.
      progress=max(response or 0,tool or 0)
-     color='working' if int(progress//3600)==int(at//3600) else 'intentional' if state=='intentional' else 'unknown' if state=='unknown' else 'degraded'
+     color='working' if state=='working' or int(progress//3600)==int(at//3600) else 'intentional' if state=='intentional' else 'unknown' if state=='unknown' else 'degraded'
      if history[index]!='working':history[index]=color
     if i and at>=now-86400:
      previous=entries[i-1];dt=at-previous[0]
