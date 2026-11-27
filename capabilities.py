@@ -6,6 +6,9 @@ import time
 
 from common import ROOT, alive, read, save
 
+DOWNLOAD_GUIDANCE = """- For permitted Python package downloads on Chinese hosts, use `python -m pip download --index-url https://pypi.tuna.tsinghua.edu.cn/simple PACKAGE`. For CUDA wheels, select the matching build at https://mirrors.nju.edu.cn/pytorch/whl/ and check its SHA-256 against PyTorch.
+- For a permitted upstream download through local fproxy, set `URL` to the file URL and run `curl --proxy http://127.0.0.1:8119 --noproxy '' -fL -C - -O "$URL"`."""
+
 NAMES=('coder','council')
 START='<!-- rstation skills -->'
 END='<!-- /rstation skills -->'
@@ -42,6 +45,12 @@ def install_skills(run,config,worker):
             canonical.unlink(missing_ok=True)
     from owner_history import sync
     sync(work, install_pointer=True)
+    if not config.get('disable_web'):
+        instructions = work / 'AGENTS.md'
+        text = instructions.read_text() if instructions.exists() else ''
+        if DOWNLOAD_GUIDANCE not in text:
+            with instructions.open('a') as out:
+                out.write('\n\n' + DOWNLOAD_GUIDANCE + '\n')
     if config.get('role')=='supervisor':return
     from common import researcher_instructions
     instruction_start='<!-- rstation research instructions -->'
