@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from antigravity import completed_turn, refresh_context_budget
+from antigravity import completed_turn, refresh_context_budget, bare_retry_error
 from common import pid_token, save, read
 from messages import Messages, prompt
 from live_watchdog import NativeWatchdog, descendants, group_has_work
@@ -292,7 +292,12 @@ class LiveCLI:
                 self.current = self.inputs.popleft() if self.inputs else None
                 self.accepted(self.current)
             if step:
-                self.gemini_events.append({'step_update': {k: step[k] for k in ('step_type', 'step_index', 'state', 'text_delta') if k in step}})
+                projected = {k: step[k] for k in ('step_type', 'step_index', 'state', 'text_delta') if k in step}
+                if step.get('step_type') == 'error_message' and not bare_retry_error(step):
+                    # Do not retain structured error bodies, but never let
+                    # projection turn a refusal or explicit failure into a bare retry.
+                    projected['explicit_error'] = True
+                self.gemini_events.append({'step_update': projected})
             if event.get('event') == 'result':
                 self.gemini_events.append(event)
                 if not completed_turn(self.gemini_events):

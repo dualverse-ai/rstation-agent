@@ -13,9 +13,19 @@ def provider_account_error(text):
         "request is blocked due to the account restrictions for prohibited use policy")
 
 
+def bare_retry_error(step):
+    """Only native metadata may be discarded after a proven successful retry."""
+    fields = {"conversation_id", "step_index", "state", "step_type", "duration_seconds"}
+    index = step.get("step_index")
+    return (set(step) <= fields and type(index) is int and index >= 0
+            and step.get("step_type") == "error_message" and step.get("state") == "DONE")
+
+
 def completed_turn(events):
     """Use current-turn evidence when agy repeats an earlier terminal error."""
     completed_replies = []
+    raw_replies = []
+    raw_replies_valid = True
     completed_replies_valid = True
     response = ""
     response_step = None
@@ -23,27 +33,41 @@ def completed_turn(events):
     native_finished = False
     finish_incomplete = False
     failed = False
+    recoverable_errors = True
+    last_error_step = -1
+    result_is_latest = False
     saw_user = False
     result = {}
     for event in events:
         step = event.get("step_update", {})
         kind = step.get("step_type")
+        if kind:result_is_latest = False
         if kind == "user_input":
             completed_replies.clear()
+            raw_replies.clear()
+            raw_replies_valid = True
             completed_replies_valid = True
             response, response_step, finished, failed = "", None, False, False
             native_finished = False
             finish_incomplete = False
             result = {}
             saw_user = True
+            recoverable_errors, last_error_step = True, -1
         elif kind == "error_message":
             failed = True
+            index = step.get("step_index")
+            recoverable_errors &= bare_retry_error(step)
+            if type(index) is int:last_error_step = max(last_error_step, index)
         elif kind == "agent_response":
             if step.get("step_index") != response_step:
                 response, finished = "", False
                 response_step = step.get("step_index")
             response += step.get("text_delta", "")
             finished = step.get("state") == "DONE"
+            if finished:
+                if type(response_step) is not int or any(index == response_step for index, _ in raw_replies):
+                    raw_replies_valid = False
+                raw_replies.append((response_step, response))
             if finished and response.strip():
                 # A terminal result can join multiple completed response steps.
                 # Repeated/unknown step identities cannot establish that match.
@@ -57,16 +81,27 @@ def completed_turn(events):
             finish_incomplete = not native_finished
         if event.get("event") == "result":
             result = event.get("result", {})
-    if failed or finish_incomplete or provider_account_error(response) or provider_account_error(result.get("response")):
+            result_is_latest = True
+    if finish_incomplete or provider_account_error(response) or provider_account_error(result.get("response")):
         return False
-    if result.get("status") == "SUCCESS":
-        return True
     # In agy 1.3.5, a successful resumed turn exits zero but its JSON result
     # can retain ERROR from history. Partial responses and fresh errors fail.
     terminal_response = result.get("response", "").strip()
     response_matches = terminal_response == response.strip() or (
         completed_replies_valid and len(completed_replies) > 1
         and terminal_response == "\n".join(text for _, text in completed_replies))
+    if failed:
+        # A bare native retry marker can precede a recovered response in the
+        # same turn. Require explicit terminal SUCCESS and an exactly matched,
+        # later completed reply; ERROR fallback never forgives such a marker.
+        return bool(result.get("status") == "SUCCESS" and not result.get("error")
+                    and result_is_latest and saw_user and recoverable_errors
+                    and completed_replies_valid and raw_replies_valid and finished and response.strip()
+                    and type(response_step) is int and response_step > last_error_step
+                    and (response_matches or terminal_response ==
+                         "".join(text for _, text in raw_replies).strip()))
+    if result.get("status") == "SUCCESS":
+        return True
     return bool(result.get("status") == "ERROR" and saw_user and terminal_response
                 and (native_finished or (finished and response.strip()
                      and response_matches)))
