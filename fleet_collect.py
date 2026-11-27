@@ -184,6 +184,44 @@ def process_info(pid):
  except (OSError,ValueError,IndexError):return None
 
 
+def native_provider_retry(runtime,state,kind,now):
+ """Current Claude launch only; export status metadata, never native error text."""
+ launch=state.get('launches');started=number(state.get('started'))
+ if kind!='claude' or type(launch)!=int or launch<0 or not started or not alive(state.get('pid'),state.get('pid_token')):return None
+ try:
+  with (runtime/f'launch_{launch:06d}'/'transcript.jsonl').open('rb') as f:
+   import os
+   info=os.fstat(f.fileno())
+   if not started<=info.st_mtime<=now or now-info.st_mtime>300:return None
+   offset=max(0,info.st_size-2*1024*1024);f.seek(offset)
+   if offset:f.readline()
+   offset=f.tell();data=f.read(2*1024*1024)
+ except OSError:return None
+ retry=None
+ for line in data.splitlines(keepends=True):
+  offset+=len(line)
+  if not line.endswith(b'\n'):continue  # A concurrently written record is not evidence.
+  try:e=json.loads(line)
+  except ValueError:continue
+  if not isinstance(e,dict):continue
+  kind_=e.get('type');subtype=e.get('subtype')
+  if kind_=='system' and subtype=='init':retry=None
+  elif kind_=='system' and subtype=='api_retry':
+   status=e.get('error_status');when=stamp(e.get('timestamp'))
+   when=info.st_mtime if when is None else when
+   retry={'id':hashlib.sha256(f'{launch}:{started}:{offset}'.encode()).hexdigest()[:20],
+          'at':when,'http_status':status if type(status)==int and 400<=status<=599 else None}
+  elif kind_=='assistant' and not e.get('error') and not e.get('is_error'):
+   message=e.get('message',{});content=message.get('content') if isinstance(message,dict) else None
+   if isinstance(content,list) and any(isinstance(p,dict) and (p.get('type')=='tool_use' or p.get('type')=='text' and p.get('text') or p.get('type')=='thinking' and p.get('thinking')) for p in content):retry=None
+  elif kind_=='stream_event':
+   event=e.get('event',{});delta=event.get('delta',{}) if isinstance(event,dict) else {}
+   if isinstance(delta,dict) and event.get('type')=='content_block_delta' and (delta.get('type')=='text_delta' and delta.get('text') or delta.get('type')=='thinking_delta' and delta.get('thinking')):retry=None
+  elif kind_=='result' and subtype=='success' and not e.get('is_error'):retry=None
+ if retry and started<=retry['at']<=now and now-retry['at']<=300 and alive(state.get('pid'),state.get('pid_token')):return retry
+ return None
+
+
 def pending_command(runtime,state,kind):
  """Only an unfinished native tool can make a GPU job foreground evidence."""
  launch=state.get('launches')
@@ -361,6 +399,7 @@ def collect(roots,host):
          'route':(state['route_index']+1) if type(state.get('route_index'))==int else None,
          'state':status,'controller_alive':ctl_live,'process_alive':native_live,'foreground_job':bool(progress_samples),'owned_job':job_live,
          'job_progress_samples':progress_samples,
+         'native_provider_retry':native_provider_retry(runtime,state,worker.get('kind'),now),
          'last_response':number(state.get('last_response')),'last_tool':number(state.get('last_tool_completed')),
          'last_success':number(state.get('last_success')),'started_at':number(state.get('started')),
          'context_tokens':number(config.get('gemini_context_tokens')) if worker.get('kind')=='gemini' else None,

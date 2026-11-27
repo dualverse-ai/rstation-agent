@@ -36,6 +36,9 @@ def health(row,now):
   return 'needs_attention','No real model response for at least 6 hours'
  sample=row.get('sampled_at')
  if number(sample) is None or not 0<=now-sample<=300:return 'transient_error','Host evidence is missing or stale'
+ retry=row.get('native_provider_retry')
+ if isinstance(retry,dict) and number(retry.get('at')) is not None and 0<=now-retry['at']<=300:
+  return 'transient_error','Native provider retry'+(' · HTTP '+str(retry['http_status']) if retry.get('http_status') else '')
  state=row.get('state')
  if state not in ('running','continuing'):
   return 'transient_error',{'blocked':'Controller reports a block','retrying':'Retrying after a failed request','paused':'Paused without a verified owner reason','stopped':'Stopped without a verified owner reason'}.get(state,'Worker is not currently working')
@@ -132,6 +135,10 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     previous=con.execute('SELECT body FROM current WHERE worker=?',(row['id'],)).fetchone()
     previous=json.loads(previous[0]) if previous else {}
     row=with_job_progress(row,previous,now)
+    retry=row.get('native_provider_retry');old_retry=previous.get('native_provider_retry')
+    if isinstance(retry,dict) and isinstance(old_retry,dict) and retry.get('id')==old_retry.get('id'):
+     # Unrelated transcript writes cannot refresh an already observed retry.
+     retry['at']=min(retry['at'],old_retry['at'])
     first=previous.get('first_observed_at')
     if first is None:
      first=con.execute('SELECT MIN(at) FROM samples WHERE worker=?',(row['id'],)).fetchone()[0]
@@ -170,6 +177,7 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
   counts={k:0 for k in ORDER};providers={}
   for row in rows:
    row.pop('job_progress_samples',None)
+   if isinstance(row.get('native_provider_retry'),dict):row['native_provider_retry'].pop('id',None)
    row.update(attention(row,now))
    row['health'],row['health_reason']=health(row,now);counts[row['health']]+=1
    entries=samples.get(row['id'],[]);history=[None]*168;observed=lost=gpu_hours=0
