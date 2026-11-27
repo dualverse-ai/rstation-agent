@@ -15,10 +15,13 @@ def provider_account_error(text):
 
 def completed_turn(events):
     """Use current-turn evidence when agy repeats an earlier terminal error."""
+    completed_replies = []
+    completed_replies_valid = True
     response = ""
     response_step = None
     finished = False
     native_finished = False
+    finish_incomplete = False
     failed = False
     saw_user = False
     result = {}
@@ -26,8 +29,11 @@ def completed_turn(events):
         step = event.get("step_update", {})
         kind = step.get("step_type")
         if kind == "user_input":
+            completed_replies.clear()
+            completed_replies_valid = True
             response, response_step, finished, failed = "", None, False, False
             native_finished = False
+            finish_incomplete = False
             result = {}
             saw_user = True
         elif kind == "error_message":
@@ -38,22 +44,32 @@ def completed_turn(events):
                 response_step = step.get("step_index")
             response += step.get("text_delta", "")
             finished = step.get("state") == "DONE"
+            if finished and response.strip():
+                # A terminal result can join multiple completed response steps.
+                # Repeated/unknown step identities cannot establish that match.
+                if response_step is None or any(index == response_step for index, _ in completed_replies):
+                    completed_replies_valid = False
+                completed_replies.append((response_step, response.strip()))
         elif kind == "tool":
             finished = native_finished = False
         elif kind == "finish":
             native_finished = step.get("state") == "DONE"
+            finish_incomplete = not native_finished
         if event.get("event") == "result":
             result = event.get("result", {})
-    if failed or provider_account_error(response) or provider_account_error(result.get("response")):
+    if failed or finish_incomplete or provider_account_error(response) or provider_account_error(result.get("response")):
         return False
     if result.get("status") == "SUCCESS":
         return True
     # In agy 1.3.5, a successful resumed turn exits zero but its JSON result
     # can retain ERROR from history. Partial responses and fresh errors fail.
     terminal_response = result.get("response", "").strip()
+    response_matches = terminal_response == response.strip() or (
+        completed_replies_valid and len(completed_replies) > 1
+        and terminal_response == "\n".join(text for _, text in completed_replies))
     return bool(result.get("status") == "ERROR" and saw_user and terminal_response
                 and (native_finished or (finished and response.strip()
-                     and terminal_response == response.strip())))
+                     and response_matches)))
 
 
 def prepare_profile(work, disable_web=False, model_name="gemini-4-carbon", context_tokens=500000, *, council=False, coder=False, adviser=False):

@@ -265,7 +265,7 @@ def test_current_native_finish_supersedes_stale_error(tmp_path,fault):
     p=tmp_path/'stream';p.write_text('\n'.join(json.dumps(e) for e in events)+'\n')
     session=type('S',(),{'transcript_path':str(p),'process':type('P',(),{'returncode':3 if fault=='nonzero_exit' else 0})()})()
     m=ResearchManager(tmp_path,config(tmp_path),environment(tmp_path))
-    try:assert m._cli_job_completion_ready('gemini_1',session)==(fault is None)
+    try:assert m._cli_job_completion_ready('gemini_1',session)==(fault in {None, 'no_finish'})
     finally:m.close()
 
 
@@ -593,3 +593,49 @@ print(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'Hell
         assert m._probe_primary(m.worker('gemini_1'))
         assert not m.active_sessions
     finally:m.close()
+
+
+@pytest.mark.parametrize('fault', [None, 'fresh_error', 'trailing_tool', 'partial',
+                                  'unrelated_result', 'reversed_result', 'new_user',
+                                  'duplicate_step', 'reused_step', 'missing_step', 'no_user'])
+def test_stale_error_matches_distinct_completed_replies(fault):
+    def step(kind, **fields):
+        return {'step_update': {'step_type': kind, 'state': 'DONE', **fields}}
+    events = [step('user_input'),
+              step('agent_response', step_index=3, state='ACTIVE', text_delta='Run '),
+              step('agent_response', step_index=3, text_delta='finished.'),
+              step('tool'),
+              step('agent_response', step_index=5, text_delta='Measured 12 units.')]
+    response = 'Run finished.\nMeasured 12 units.'
+    if fault == 'fresh_error': events.append(step('error_message'))
+    if fault == 'trailing_tool': events.append(step('tool'))
+    if fault == 'partial': events[-1]['step_update']['state'] = 'ACTIVE'
+    if fault == 'unrelated_result': response = 'An unrelated answer.'
+    if fault == 'reversed_result': response = 'Measured 12 units.\nRun finished.'
+    if fault == 'new_user': events.append(step('user_input'))
+    if fault == 'duplicate_step':
+        events.append(step('agent_response', step_index=5, text_delta=''))
+        response += '\nMeasured 12 units.'
+    if fault == 'reused_step':
+        events.append(step('agent_response', step_index=3, text_delta='Another reply.'))
+        response += '\nAnother reply.'
+    if fault == 'missing_step':
+        for e in events: e['step_update'].pop('step_index', None)
+    if fault == 'no_user': events.pop(0)
+    events.append({'event': 'result', 'result': {
+        'status': 'ERROR', 'error': 'earlier stream error', 'response': response}})
+    assert completed_turn(events) == (fault is None)
+
+
+def test_joined_replies_are_reset_at_new_user_boundary():
+    def reply(index, text):
+        return {'step_update': {'step_type': 'agent_response', 'state': 'DONE',
+                                'step_index': index, 'text_delta': text}}
+    user = {'step_update': {'step_type': 'user_input', 'state': 'DONE'}}
+    events = [user, reply(1, 'Old reply.'), user,
+              reply(2, 'First current reply.'), reply(3, 'Second current reply.')]
+    terminal = {'event': 'result', 'result': {'status': 'ERROR',
+                'response': 'First current reply.\nSecond current reply.'}}
+    assert completed_turn(events + [terminal])
+    terminal['result']['response'] = 'Old reply.\nFirst current reply.\nSecond current reply.'
+    assert not completed_turn(events + [terminal])
