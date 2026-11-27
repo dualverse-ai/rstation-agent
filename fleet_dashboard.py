@@ -16,6 +16,7 @@ from urllib.parse import urlsplit,quote
 
 from fleet_collect import label,number,stamp,canonical_key_name
 ROOT=Path(__file__).resolve().parent
+ATTENTION_SECONDS=6*3600
 ORDER={'down':0,'degraded':1,'unknown':2,'working':3,'intentional':4}
 
 
@@ -34,6 +35,20 @@ def health(row,now):
  if state=='retrying':return 'degraded','Retrying after a failed request'
  if age<=1800:return 'working','Recent response or completed tool'
  return 'degraded','No response or completed tool for 30 minutes'
+
+
+def attention(row,now):
+ """One predicate shared by the page and external notification consumers."""
+ def valid(value):return number(value) is not None and 0<value<=now
+ times=[row.get(k) for k in ('last_response','last_tool','attention_progress_at') if valid(row.get(k))]
+ since=max(times) if times else row.get('first_observed_at')
+ if not valid(since):since=None
+ sample=row.get('sampled_at')
+ known=bool(valid(sample) and now-sample<=300 and since is not None)
+ due=since+ATTENTION_SECONDS if since is not None else None
+ return {'needs_attention':bool(known and not row.get('intentional_stop') and now>=due),
+         'attention_known':known,'attention_since':since,'attention_due_at':due,
+         'attention_threshold_seconds':ATTENTION_SECONDS}
 
 
 def with_job_progress(row,previous,now):
@@ -68,7 +83,7 @@ def family_summary(rows, now):
   elif not fresh or all(r.get('health')=='unknown' for r in active):status='unknown'
   else:status='no_recent_response'
   result.append({'family':family,'status':status,'counts':counts,'total':len(selected),
-                 'need_attention':counts['down']+counts['degraded'],'last_response':latest})
+                 'need_attention':sum(attention(r,now)['needs_attention'] for r in selected),'last_response':latest})
  return result
 
 
@@ -110,7 +125,14 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
    con.execute('INSERT OR REPLACE INTO hosts VALUES(?,?,?)',(snapshot['host'],now,';'.join(snapshot.get('errors',[])) or None))
    for row in snapshot['workers']:
     previous=con.execute('SELECT body FROM current WHERE worker=?',(row['id'],)).fetchone()
-    row=with_job_progress(row,json.loads(previous[0]) if previous else {},now)
+    previous=json.loads(previous[0]) if previous else {}
+    row=with_job_progress(row,previous,now)
+    first=previous.get('first_observed_at')
+    if first is None:
+     first=con.execute('SELECT MIN(at) FROM samples WHERE worker=?',(row['id'],)).fetchone()[0]
+    row['first_observed_at']=first if first is not None else now
+    progress=[previous.get('attention_progress_at'),row.get('last_response'),row.get('last_tool'),row.get('last_job_progress')]
+    row['attention_progress_at']=max((v for v in progress if number(v) is not None and 0<v<=now),default=None)
     state,reason=health(row,now);row=dict(row,health=state,health_reason=reason)
     con.execute('INSERT OR REPLACE INTO current VALUES(?,?)',(row['id'],json.dumps(row)))
     con.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?)',(row['id'],now,state,row.get('last_response'),row.get('last_tool'),len(row.get('gpu',[]))))
@@ -142,6 +164,7 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
   counts={k:0 for k in ORDER};providers={}
   for row in rows:
    row.pop('job_progress_samples',None)
+   row.update(attention(row,now))
    row['health'],row['health_reason']=health(row,now);counts[row['health']]+=1
    entries=samples.get(row['id'],[]);history=[None]*168;observed=lost=gpu_hours=0
    for i,(at,state,response,tool,gpus) in enumerate(entries):
@@ -192,8 +215,8 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     old=keys[ident]['history'][index]
     if old is None or priority[status]>priority[old]:keys[ident]['history'][index]=status
   key_rows=sorted(keys.values(),key=lambda k:({'errors':0,'mixed':1,'unknown':2,'working':3}[k['status']],k['endpoint'],k['names']))
-  rows.sort(key=lambda r:(ORDER[r['health']],r.get('problem') or '',r['id']))
-  return {'now':now,'counts':counts,'hosts':hosts,'workers':rows,'providers':list(providers.values()),'families':family_summary(rows,now),'provider_keys':key_rows,'key_identity_unknown':sum(not r.get('provider_key_id') and r['health']!='intentional' for r in rows),'history_start':min((v[0][0] for v in samples.values() if v),default=None)}
+  rows.sort(key=lambda r:(not r['needs_attention'],ORDER[r['health']],r.get('problem') or '',r['id']))
+  return {'now':now,'need_attention':sum(r['needs_attention'] for r in rows),'attention_threshold_seconds':ATTENTION_SECONDS,'counts':counts,'hosts':hosts,'workers':rows,'providers':list(providers.values()),'families':family_summary(rows,now),'provider_keys':key_rows,'key_identity_unknown':sum(not r.get('provider_key_id') and r['health']!='intentional' for r in rows),'history_start':min((v[0][0] for v in samples.values() if v),default=None)}
 
 
 def fetch_public(handle):

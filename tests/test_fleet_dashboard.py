@@ -121,7 +121,7 @@ def test_owned_gpu_job_is_not_assumed_foreground(tmp_path,monkeypatch):
  ([row(sampled_at=19000,last_response=19999)],'unknown',0,0),
  ([row(last_response=None)],'unknown',0,0),
  ([row(state='paused',intentional_stop=True)],'inactive',0,0),
- ([row(last_response=19999),row(id='two',state='blocked',last_response=100)],'responding',1,1),
+ ([row(last_response=19999),row(id='two',state='blocked',last_response=100)],'responding',1,0),
 ])
 def test_family_summary_uses_recent_real_responses(workers,status,working,attention):
  from fleet_dashboard import family_summary
