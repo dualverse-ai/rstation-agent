@@ -179,7 +179,7 @@ class ResearchManager(CliJobManager):
         from provider_control import refresh
         refresh(self,name)
         from worker_control import guard_launch
-        if self.states[name].get("blocked_reason")=="model_refusal" or not guard_launch(self,name):
+        if self.states[name].get("blocked_reason") in {"model_refusal","claude_compaction_failed"} or not guard_launch(self,name):
             s=self.states[name]
             return CliJobState(self.worker(name)["kind"],s["spawn"],s["resumes"],2**31,14,s.get("token"),s.get("next",0),False,False)
         s=self.states[name]
@@ -189,7 +189,7 @@ class ResearchManager(CliJobManager):
         return f"launch_{self.states[name]['launches']+1:06d}"
     def _claim_cli_job_launch(self,name,session_id,decision):
         from worker_control import guard_launch
-        if self.states[name].get("blocked_reason")=="model_refusal" or not guard_launch(self,name):return None
+        if self.states[name].get("blocked_reason") in {"model_refusal","claude_compaction_failed"} or not guard_launch(self,name):return None
         s=self.states[name]
         s.update(spawn=decision.spawn_count,resumes=decision.resume_count,launches=s["launches"]+1,
                  status="starting",route_count=decision.endpoint_resume_count or 0)
@@ -261,6 +261,12 @@ class ResearchManager(CliJobManager):
                    TMPDIR=str(work/".tmp"),PATH=self.bin_paths[w["kind"]][1],PYTHONUNBUFFERED="1",
                    VIRTUAL_ENV=str(work/".venv"),CUDA_VISIBLE_DEVICES="",OMP_NUM_THREADS="5",OPENBLAS_NUM_THREADS="5",MKL_NUM_THREADS="5",
                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        env.pop("RSTATION_CLAUDE_COMPACT",None)
+        recovery = self.states[name].get('claude_compaction', {})
+        if w["kind"] == "claude" and not self.probe and recovery.get('pending') and recovery.get('session') == self.states[name].get('token'):
+            env['RSTATION_CLAUDE_COMPACT'] = recovery['session']
+            recovery['pending'] = False
+            self.persist(name)
         env.pop("RSTATION_GEMINI_COMPACT",None)
         env.pop("RSTATION_WORKER_LIVE_INPUT",None)
         if self.config.get("live_input", False) and not self.probe:
@@ -395,12 +401,17 @@ class ResearchManager(CliJobManager):
             command=list(prepared.command)
             if "workspace-write" in command:command[command.index("workspace-write")]="danger-full-access"
             prepared=replace(prepared,command=command)
+        native_binary = prepared.command[0]
         if spec.env.get("RSTATION_WORKER_LIVE_INPUT")=="1":
             command=[sys.executable,str(ROOT/"live_cli.py"),"--kind",spec.backend,
                      "--workspace",spec.workspace_root,"--prompt-file",str(Path(spec.run_dir)/"prompt.txt"),
                      "--model",spec.model_name,"--conversation",decision.resume_token or "",
                      "--",*prepared.command]
             prepared=replace(prepared,command=command,stdin_text=None)
+        compact_sid = spec.env.get("RSTATION_CLAUDE_COMPACT")
+        if compact_sid and spec.backend == "claude" and compact_sid == decision.resume_token:
+            prepared = replace(prepared, command=[sys.executable, str(ROOT/"claude_compaction.py"),
+                str(spec.workspace_root), compact_sid, native_binary, spec.model_name, *prepared.command])
         return prepared
     def _mark_cli_job_pid(self,name,pid):
         self.states[name].update(pid=pid,pid_token=pid_token(pid),last_process_group=pid,status="running",started=time.time())
@@ -435,6 +446,7 @@ class ResearchManager(CliJobManager):
         s.update(token=token or s.get("token"),resumes=0,next=time.time()+5,status="probe_ok" if self.probe else "continuing",
                  pid=None,last_success=time.time(),route_count=0,route_offset=index-seed)
         self._endpoint_resume_counts[name]=0
+        s.pop('claude_compaction',None)
         self.persist(name);self.log(name,"Turn completed; continuing research." if not self.probe else "Model connectivity check passed.")
     def _block_model_refusal(self,name,failure):
         if failure.category!="model_refusal":return False
@@ -452,6 +464,8 @@ class ResearchManager(CliJobManager):
         if schedule(self,name,session,failure):return
         if handle_failure(self,name,failure):return
         if self._block_model_refusal(name,failure):return
+        from claude_compaction import schedule as schedule_compaction
+        if schedule_compaction(self,name,session,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
         s=self.states[name]
@@ -494,6 +508,13 @@ class ResearchManager(CliJobManager):
                  "no rollout found for thread id")
         if confirmed_model_refusal:
             return CliJobFailure("model_refusal",False,"Native model refusal; retain conversation for operator review.")
+        if getattr(session,"backend",None)=="claude":
+            from claude_compaction import overflow
+            terminal = next((e for e in reversed(list(self._read_transcript_events(session.transcript_path))) if e.get("type") in {"result","assistant","user"}), {})
+            if terminal.get('is_error') and terminal.get('result') == 'rstation: native Claude compaction failed':
+                return CliJobFailure("claude_compaction_failed",False,"Native Claude compaction failed.")
+            if overflow(terminal):
+                return CliJobFailure("claude_context_overflow",True,"Claude reported a context overflow.")
         if any(marker in detail for marker in markers):
             self.states[name]["session_unavailable"]=True
             return CliJobFailure("session_unavailable",False,"The CLI reports that the saved conversation is unavailable.")
@@ -509,6 +530,8 @@ class ResearchManager(CliJobManager):
         if schedule(self,name,session,failure):return
         if handle_failure(self,name,failure):return
         if self._block_model_refusal(name,failure):return
+        from claude_compaction import schedule as schedule_compaction
+        if schedule_compaction(self,name,session,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
         s=self.states[name]
