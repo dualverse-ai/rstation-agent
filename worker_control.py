@@ -103,6 +103,8 @@ def queue_request(run, name, *, expected_revision, model=None, provider_route=No
         config = read(run / 'run.json', {})
         state = read(folder / 'state.json', {})
         base = base_settings(config, name)
+        if base['worker']['kind'] == 'gemini' and provider_route is not None:
+            raise ValueError('Gemini automatically selects among enabled providers. Use auto.')
         control = state.get('worker_control', {})
         spec = dict(expected_revision=expected_revision, model=model, provider_route=provider_route,
                     change_route=change_route, restart=restart)
@@ -201,6 +203,9 @@ def _process_requests(manager):
                     request['workspace'] != dict(path=str(work), device=stat.st_dev, inode=stat.st_ino)):
                 _reject(folder, request, 'Worker, session, configuration or configured routes changed.')
                 continue
+            if original['kind'] == 'gemini' and request['spec'].get('provider_route') is not None:
+                _reject(folder, request, 'Gemini now selects among enabled providers automatically.')
+                continue
             if has_jobs(work): continue
             from live_watchdog import group_has_work
             group = state.get('pid') or state.get('last_process_group') or request.get('process_group')
@@ -263,6 +268,10 @@ def guard_launch(manager, name):
     from provider_control import guard_session
     guard_session(manager,name)
     state = manager.states[name]
+    if not manager.probe and manager.worker(name)['kind'] == 'gemini':
+        from gemini_failover import guard
+        if not guard(manager, name):
+            return False
     hold = state.get('worker_control_hold')
     if hold:
         if state.get('token') != hold['session_id']:

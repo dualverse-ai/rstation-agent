@@ -18,7 +18,7 @@ from live_watchdog import descendants, group_has_work, process
 
 def code_revision():
     digest = hashlib.sha256()
-    for name in ('main.py', 'recovery.py', 'worker_control.py', 'provider_control.py', 'live_cli.py', 'controller_guard.py', 'capabilities.py', 'coder.py', 'coder_service.py', 'coder_workspace.py', 'council.py', 'council_service.py', 'antigravity.py'):
+    for name in ('main.py', 'recovery.py', 'gemini_failover.py', 'gemini_compaction.py', 'worker_control.py', 'provider_control.py', 'live_cli.py', 'controller_guard.py', 'capabilities.py', 'coder.py', 'coder_service.py', 'coder_workspace.py', 'council.py', 'council_service.py', 'antigravity.py'):
         digest.update((ROOT/name).read_bytes())
     return digest.hexdigest()[:16]
 

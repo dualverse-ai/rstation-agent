@@ -138,6 +138,10 @@ def require_no_pending(run,name):
 def probe(config,worker,entries,environment):
     """One exact route/model per disposable native conversation; no saved research input."""
     from recovery import ResearchManager
+    if worker['kind'] == 'gemini':
+        from gemini_failover import filter_routes
+        for entry in entries:
+            filter_routes([entry])
     for entry in entries:
         with tempfile.TemporaryDirectory(prefix='rstation-provider-check-') as tmp:
             env=dict(environment)

@@ -113,12 +113,17 @@ def preflight(config,env):
     for kind in dict.fromkeys(w["kind"] for w in config["workers"]):
         template=next(w for w in config["workers"] if w["kind"]==kind)
         pool=routes(kind,env)
+        if kind == 'gemini':
+            from gemini_failover import filter_routes
+            pool = filter_routes(pool, expand=True)
         for index in range(len(pool)):
             print(f"Checking {kind} / {template['model']} through provider {index+1}/{len(pool)}...",flush=True)
             with tempfile.TemporaryDirectory(prefix="rstation-agent-probe-") as tmp:
                 worker={**template,"route_seed":index,"gpus":[]}
                 probe_config={**config,"workers":[worker],"idle_seconds":60}
                 manager=ResearchManager(tmp,probe_config,env,probe=True)
+                if kind == 'gemini':
+                    manager._provider_pools = {worker['name']: [pool[index]]}
                 success=False
                 try:
                     manager.launch_cli_job(worker["name"])

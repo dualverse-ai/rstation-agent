@@ -95,7 +95,56 @@ def family_summary(rows, now):
  return result
 
 
-def key_observation(key_id,rows,now):
+
+def with_gemini_incidents(row, previous, now):
+ """Track each long-tool wait by native launch and step, across collection restarts."""
+ if row.get('family')!='gemini':
+  return row
+ tools=row.pop('gemini_tool_observation',{})
+ signals={}
+ if row.get('gemini_exhausted'):
+  signals['routes_exhausted']=str(row.get('gemini_exhausted_since') or row.get('model'))
+ if row.get('gemini_compaction_block'):
+  signals['compaction_blocked']=row['gemini_compaction_block']
+ if tools.get('identical_reads'):
+  signals['identical_reads']=tools['identical_reads']
+ if tools.get('pending_command'):
+  signals['long_command']=tools['pending_command']
+ tracking={}
+ incidents={}
+ for kind,identity in signals.items():
+  old=previous.get('gemini_incident_tracking',{}).get(kind,{})
+  since=old.get('since',now) if old.get('identity')==identity else now
+  tracking[kind]=dict(identity=identity,since=since)
+  if kind=='long_command':
+   progress=max(since,row.get('last_job_progress') or 0)
+   if now-progress<3600:
+    continue
+  incidents[kind]=since
+ return dict(row,gemini_incident_tracking=tracking,gemini_incidents=incidents)
+
+
+def gemini_key_evidence(key_id,rows,now):
+ """The most recent terminal outcome for each model on this key survives switches."""
+ records={}
+ eligible=set()
+ for row in rows:
+  if row.get('intentional_stop') or not 0<=now-row.get('sampled_at',0)<=300:
+   continue
+  if key_id not in row.get('gemini_enabled',[]):
+   continue
+  if row.get('model'):
+   eligible.add(row['model'])
+  for model,items in row.get('gemini_model_observations',{}).items():
+   item=items.get(key_id,{})
+   if not 0<(item.get('at') or 0)<=now:
+    continue
+   if item['at']>records.get(model,{}).get('at',0):
+    records[model]=item
+ return records,eligible
+
+
+def key_observation(key_id,rows,now,enabled=None):
  selected=[r for r in rows if r.get('provider_key_id')==key_id and not r.get('intentional_stop') and 0<=now-r.get('sampled_at',0)<=300]
  responses=[r['last_response'] for r in selected if r.get('started_at') and r.get('last_response') and r['started_at']<=r['last_response']<=now]
  latest=max(responses,default=None)
@@ -103,8 +152,42 @@ def key_observation(key_id,rows,now):
  recent=latest is not None and now-latest<=600
  status='mixed' if recent and failing else 'working' if recent else 'errors' if failing else 'unknown'
  errors=sorted({str(r.get('error',{}).get('http_status') or 'provider unavailable') for r in failing})
+ reports,eligible=gemini_key_evidence(key_id,rows,now)
+ if reports:
+  failed=[(model,item) for model,item in reports.items() if item['status']=='errors']
+  successes=[item['at'] for item in reports.values() if item['status']=='working']
+  interrupted=any(item['status']=='interrupted' for item in reports.values())
+  latest=max([latest or 0,*successes]) or None
+  # A recorded failure remains the current outcome until a newer attempt supersedes it.
+  # Old successes of unrelated models have dates in the breakdown but cannot dilute a red badge.
+  responding=any(now-at<=600 for at in successes)
+  if failed:
+   status='mixed' if responding else 'errors'
+  elif responding:
+   status='working'
+  elif interrupted:
+   status='interrupted'
+  else:
+   status='last_success'
+  errors=[model+' '+('HTTP '+str(item['http_status']) if item.get('http_status') else 'provider failure') for model,item in failed]
+ elif status=='unknown' and (eligible or enabled is True):
+  status='untried'
+ if enabled is False and not selected and not eligible:
+  status='disabled'
+ model_status={model:dict(status='untried') for model in eligible}
+ for row in selected:
+  model=row.get('model')
+  if model not in eligible or model in reports or not row.get('process_alive'):
+   continue
+  started=number(row.get('gemini_attempt_started'))
+  if started and started<=now and now-row['sampled_at']<=300:
+   model_status[model]=dict(status='attempting',at=started)
+   if status=='untried':
+    status='attempting'
+ model_status.update(reports)
+ models=set(model_status)|{r['model'] for r in selected if r.get('model')}
  return {'status':status,'last_response':latest,'workers':len(selected),'errors':errors,
-         'models':sorted({r.get('model') for r in selected if r.get('model')})}
+         'models':sorted(models),'model_status':model_status}
 
 
 class Store:
@@ -135,6 +218,7 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     previous=con.execute('SELECT body FROM current WHERE worker=?',(row['id'],)).fetchone()
     previous=json.loads(previous[0]) if previous else {}
     row=with_job_progress(row,previous,now)
+    row=with_gemini_incidents(row,previous,now)
     retry=row.get('native_provider_retry');old_retry=previous.get('native_provider_retry')
     if isinstance(retry,dict) and isinstance(old_retry,dict) and retry.get('id')==old_retry.get('id'):
      # Unrelated transcript writes cannot refresh an already observed retry.
@@ -153,8 +237,12 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
     con.execute('DELETE FROM key_inventory WHERE host=?',(snapshot['host'],))
    for key in snapshot.get('provider_keys',[]):
     con.execute('INSERT OR REPLACE INTO key_inventory VALUES(?,?,?,?,?)',(snapshot['host'],key['id'],key['name'],now,json.dumps(key)))
-   for ident in {k['id'] for k in snapshot.get('provider_keys',[])}:
-    observation=key_observation(ident,snapshot['workers'],now)
+   policies={}
+   for key in snapshot.get('provider_keys',[]):
+    policies.setdefault(key['id'],set()).add(key.get('enabled'))
+   for ident,flags in policies.items():
+    enabled=True if True in flags else False if False in flags else None
+    observation=key_observation(ident,snapshot['workers'],now,enabled)
     con.execute('INSERT OR REPLACE INTO key_samples VALUES(?,?,?,?,?)',(snapshot['host'],ident,now,observation['status'],observation['last_response']))
    con.execute('DELETE FROM key_samples WHERE at<?',(now-8*86400,))
    con.execute('DELETE FROM samples WHERE at<?',(now-8*86400,))
@@ -177,6 +265,7 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
   counts={k:0 for k in ORDER};providers={}
   for row in rows:
    row.pop('job_progress_samples',None)
+   row.pop('gemini_incident_tracking',None)
    if isinstance(row.get('native_provider_retry'),dict):row['native_provider_retry'].pop('id',None)
    row.update(attention(row,now))
    row['health'],row['health_reason']=health(row,now);counts[row['health']]+=1
@@ -208,26 +297,29 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
   keys={}
   for host,ident,name,at,body in inventory:
    info=json.loads(body)
-   k=keys.setdefault(ident,{'id':ident,'names':set(),'labels':set(),'endpoint':info['endpoint'],'hosts':set(),'families':set(),'sampled_at':0})
+   k=keys.setdefault(ident,{'id':ident,'names':set(),'labels':set(),'endpoint':info['endpoint'],'hosts':set(),'families':set(),'policy':set(),'sampled_at':0})
+   k['policy'].add(info.get('enabled'))
    k['names'].add(name)
    canonical=canonical_key_name(info.get('label'))
    if canonical:k['labels'].add(canonical)
    k['hosts'].add(host);k['families'].add(info['family']);k['sampled_at']=max(k['sampled_at'],at)
   for ident,k in keys.items():
-   k.update(key_observation(ident,rows,now));k['names']=sorted(k['names']);k['labels']=sorted(k['labels']);k['hosts']=sorted(k['hosts']);k['families']=sorted(k['families']);k['history']=[None]*18
+   flags=k.pop('policy')
+   enabled=True if True in flags else False if False in flags else None
+   k.update(key_observation(ident,rows,now,enabled));k['names']=sorted(k['names']);k['labels']=sorted(k['labels']);k['hosts']=sorted(k['hosts']);k['families']=sorted(k['families']);k['history']=[None]*18
    k['display_name']=k['labels'][0] if len(k['labels'])==1 else None
    k['name_status']='named' if len(k['labels'])==1 else 'conflict' if k['labels'] else 'missing'
    k['last_response']=max(k['last_response'] or 0,key_responses.get(ident) or 0) or None
    if now-k['sampled_at']>300:k['status']='unknown'
    elif k['status']=='unknown' and k['last_response'] and 0<=now-k['last_response']<=600:k['status']='working'
-  priority={'unknown':0,'working':1,'mixed':2,'errors':3}
+  priority={'unknown':0,'disabled':0,'untried':0,'attempting':1,'interrupted':1,'last_success':1,'working':2,'mixed':3,'errors':4}
   for ident,at,status in key_samples:
    if ident not in keys:continue
    index=int(at//300)-int(now//300)+17
    if 0<=index<18:
     old=keys[ident]['history'][index]
     if old is None or priority[status]>priority[old]:keys[ident]['history'][index]=status
-  key_rows=sorted(keys.values(),key=lambda k:({'errors':0,'mixed':1,'unknown':2,'working':3}[k['status']],k['endpoint'],k['names']))
+  key_rows=sorted(keys.values(),key=lambda k:({'errors':0,'mixed':1,'interrupted':2,'working':3,'last_success':4,'attempting':4,'untried':5,'unknown':6,'disabled':7}[k['status']],k['endpoint'],k['names']))
   rows.sort(key=lambda r:(not r['needs_attention'],ORDER[r['health']],r.get('problem') or '',r['id']))
   return {'now':now,'active_total':len(rows)-counts['intentional'],'need_attention':counts['needs_attention'],'attention_threshold_seconds':ATTENTION_SECONDS,'counts':counts,'hosts':hosts,'workers':rows,'providers':list(providers.values()),'families':family_summary(rows,now),'provider_keys':key_rows,'key_identity_unknown':sum(not r.get('provider_key_id') and r['health']!='intentional' for r in rows),'history_start':min((v[0][0] for v in samples.values() if v),default=None)}
 

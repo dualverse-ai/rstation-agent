@@ -352,10 +352,123 @@ def gpu_progress(work,state,kind):
   os.close(read_fd);os.waitpid(child,0)
 
 
+
+def gemini_tool_observation(runtime, state):
+ """Return only opaque identities for a pending command or a series of identical reads."""
+ launch = state.get('launches')
+ if type(launch) != int or launch < 0:
+  return {}
+ path = runtime / f'launch_{launch:06d}' / 'transcript.jsonl'
+ try:
+  with path.open('rb') as stream:
+   end = stream.seek(0, 2)
+   offset = max(0, end - 512 * 1024)
+   stream.seek(offset)
+   if offset:
+    stream.readline(512 * 1024)
+   lines = stream.read(512 * 1024).splitlines(keepends=True)
+ except OSError:
+  return {}
+ pending = {}
+ previous = None
+ indices = set()
+ conversation = state.get('token')
+ if not conversation:
+  return {}
+ for line in lines:
+  if not line.endswith(b'\n'):
+   continue
+  try:
+   event = json.loads(line)
+  except (ValueError, UnicodeError):
+   continue
+  if not isinstance(event, dict):
+   continue
+  step = event.get('step_update')
+  if event.get('event') == 'result' or isinstance(step,dict) and step.get('step_type') == 'user_input':
+   pending.clear()
+   previous = None
+   indices.clear()
+   continue
+  if not isinstance(step,dict) or step.get('step_type') != 'tool' or step.get('conversation_id') != conversation:
+   continue
+  index = step.get('step_index')
+  if type(index) != int:
+   continue
+  name = step.get('tool_name')
+  status = step.get('state')
+  if status in ('ACTIVE','RUNNING','IN_PROGRESS') and name == 'run_command':
+   pending[index] = True
+  if status not in ('DONE','FAILED','ERROR','CANCELLED'):
+   continue
+  pending.pop(index, None)
+  info = step.get('tool_info')
+  args = info.get('parameters') if isinstance(info,dict) else None
+  if isinstance(args,str):
+   try:
+    args = json.loads(args)
+   except ValueError:
+    args = None
+  if name not in ('read_file','view_file') or not isinstance(args,dict) or not args:
+   previous = None
+   indices.clear()
+   continue
+  # Include offsets and limits: sequential ranges of one file are ordinary work.
+  signature = json.dumps([name,args],sort_keys=True)
+  if signature != previous:
+   previous = signature
+   indices.clear()
+  indices.add(index)
+ def identity(index):
+  return hashlib.sha256(f'{conversation}/{launch}/{index}'.encode()).hexdigest()[:24]
+ result = {}
+ if len(indices) >= 5:
+  result['identical_reads'] = identity(previous)
+ if pending:
+  result['pending_command'] = identity(min(pending))
+ return result
+
+
+def rotation_observation(rotation):
+ """Validate the versioned controller evidence before exporting it."""
+ enabled = rotation.get('enabled')
+ if rotation.get('version') != 1 or not isinstance(enabled,list):
+  return {}
+ enabled = [k for k in enabled[:32] if isinstance(k,str) and re.fullmatch('[0-9a-f]{64}',k)]
+ models = {}
+ def add(model,key,item):
+  if not label(model) or key not in enabled or not isinstance(item,dict):
+   return
+  at = number(item.get('at'))
+  if not at or item.get('status') not in ('errors','working','interrupted'):
+   return
+  records = models.setdefault(model,{})
+  if records.get(key,{}).get('at',0) >= at:
+   return
+  code = item.get('http_status')
+  records[key] = dict(at=at, status=item['status'], attempted_at=number(item.get('attempted_at')),
+                      http_status=code if type(code)==int and 400<=code<=599 else None)
+ for model,items in rotation.get('model_observations',{}).items():
+  if isinstance(items,dict):
+   for key,item in items.items():
+    add(model,key,item)
+ for key,item in rotation.get('observations',{}).items():
+  if isinstance(item,dict):
+   add(item.get('model'),key,item)
+ result = dict(gemini_enabled=enabled,gemini_model_observations=models,
+               gemini_exhausted=rotation.get('exhausted') is True,
+               gemini_exhausted_since=number(rotation.get('exhausted_since')))
+ if rotation.get('key') in enabled:
+  result.update(provider_key_id=rotation['key'],provider_key_source='Gemini launch record',
+                route=enabled.index(rotation['key'])+1,gemini_attempt_started=number(rotation.get('started')))
+ return result
+
+
 def collect(roots,host):
  now=time.time();rows=[];failures=[];inventory={}
  for root in roots:
   root=Path(root);data=root/'agent_data';profile_env=profile_environment(root)
+  allowed=read(root/'gemini-routing.json').get('enabled')
   key_labels=read(root/'.provider-labels.json').get('labels',{})
   if not data.is_dir():failures.append('missing_root');continue
   for config_path in sorted(data.glob('*/run.json')):
@@ -371,6 +484,8 @@ def collect(roots,host):
      title=key_labels.get(key['id']) if isinstance(key_labels,dict) else None
      canonical=canonical_key_name(title)
      if canonical:key['label']=canonical
+     if key['family']=='gemini' and isinstance(allowed,list):
+      key['enabled']=key['id'] in allowed
      inventory[(key['id'],key['name'])]=key
     held=[];job_live=False
     for path in (runtime/'gpu-jobs').glob('*.json'):
@@ -414,6 +529,12 @@ def collect(roots,host):
     # Operator-maintained reason metadata is explicitly required; PAUSE alone is not evidence of owner intent.
     reason=read(runtime/'operator-pause.json')
     row['intentional_stop']=bool(status in ('paused','stopped') and reason.get('owner_authorized') is True and reason.get('message_id'))
+    if worker.get('kind')=='gemini':
+     row.update(rotation_observation(state.get('gemini_rotation',{})))
+     if state.get('blocked_reason') in ('gemini_context_limit','gemini_compaction_failed'):
+      row['gemini_compaction_block']=state['blocked_reason']
+     if native_live and not paused and not stopped:
+      row['gemini_tool_observation']=gemini_tool_observation(runtime,state)
     rows.append(row)
  return {'host':host,'sampled_at':now,'workers':rows,'errors':failures,'provider_keys':list(inventory.values())}
 

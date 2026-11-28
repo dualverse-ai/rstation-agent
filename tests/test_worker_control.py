@@ -246,7 +246,9 @@ def test_gemini_model_change_preserves_native_store_context_and_notices(tmp_path
     notices=(work/'.runtime/operator_messages.json').read_bytes()
     m=ResearchManager(tmp_path,c,e)
     try:
-        queue_request(tmp_path,'gemini_1',expected_revision=0,model='gemini-4-carbon',provider_route=2,change_route=True,environment=e)
+        with pytest.raises(ValueError,match='automatically selects'):
+            queue_request(tmp_path,'gemini_1',expected_revision=0,model='gemini-4-carbon',provider_route=2,change_route=True,environment=e)
+        queue_request(tmp_path,'gemini_1',expected_revision=0,model='gemini-4-carbon',provider_route=None,change_route=True,environment=e)
         process_requests(m)
         decision=CliJobLaunchDecision('resume',4,1,FRESH)
         claimed=m._claim_cli_job_launch('gemini_1','launch_000009',decision)
@@ -254,7 +256,7 @@ def test_gemini_model_change_preserves_native_store_context_and_notices(tmp_path
         prepared_launch=m._prepare_cli_job_launch(spec,decision,m._get_cli_job_backend)
         assert FRESH in prepared_launch.command
         assert spec.model_name=='gemini-4-carbon'
-        assert spec.env['GOOGLE_GEMINI_BASE_URL']=='http://127.0.0.1:2'
+        assert spec.env['GOOGLE_GEMINI_BASE_URL']==e['RSTATION_WORKER_GEMINI_BASE_URL']
         assert c['gemini_context_tokens']==700000
         assert [p.read_bytes() for p in stores]==before
         assert (work/'.runtime/operator_messages.json').read_bytes()==notices

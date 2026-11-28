@@ -54,7 +54,8 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class GeminiStream:
-    def __init__(self, base_url):
+    def __init__(self, base_url, *, transform_body=None):
+        self.transform_body = transform_body
         parsed = urlsplit(base_url)
         if (parsed.scheme not in {'http', 'https'} or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query or parsed.fragment):
@@ -86,10 +87,19 @@ class GeminiStream:
                 except (TypeError, ValueError):
                     self.send_error(411)
                     return
+                if bridge.transform_body and size > 64 * 1024 * 1024:
+                    self.send_error(413)
+                    return
                 body = self.rfile.read(size)
                 if len(body) != size:
                     self.close_connection = True
                     return
+                if bridge.transform_body:
+                    try:
+                        body = bridge.transform_body(body)
+                    except (ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError):
+                        self.send_error(400, 'Invalid compaction request')
+                        return
                 excluded = {'host', 'connection', 'content-length', 'accept-encoding',
                             'transfer-encoding', 'proxy-authorization'}
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in excluded}
@@ -102,7 +112,7 @@ class GeminiStream:
                 started = False
                 try:
                     try:
-                        response = opener.open(request)
+                        response = opener.open(request, timeout=175) if bridge.transform_body else opener.open(request)
                     except HTTPError as error:
                         response = error  # Preserve HTTP failures for native retries.
                     with response:

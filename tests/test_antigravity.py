@@ -121,6 +121,11 @@ def test_dedicated_routes_rotate_without_station_fallback(tmp_path):
     m=ResearchManager(tmp_path,c,e)
     try:
         for count in [0,1,2,3,4]:
+            # Exercise both explicit controller selections; endpoint retry budget
+            # changes alone cannot move a healthy conversation to another route.
+            from gemini_failover import key_id
+            expected = count // 2 % 2
+            m.states['gemini_1'].setdefault('gemini_rotation', {})['next_key'] = key_id(m.provider_pool('gemini_1')[expected])
             d=CliJobLaunchDecision('resume',1,count,'saved',count)
             spec=m._build_cli_job_launch_spec('gemini_1','launch_test',d,m.states['gemini_1'])
             assert spec.env['GEMINI_API_KEY']==('gemini-test-key' if count//2%2==0 else 'backup')
@@ -313,7 +318,7 @@ def test_direct_model_bypasses_router_with_platform_proxy(tmp_path,model_proxy):
 
 
 @pytest.mark.parametrize('live_input',[False,True])
-def test_stalled_gemini_rotates_and_resumes_same_conversation(tmp_path,monkeypatch,live_input):
+def test_stalled_gemini_retries_once_on_same_route_and_resumes_same_conversation(tmp_path,monkeypatch,live_input):
     c=config(tmp_path);c.update(idle_seconds=1,live_input=live_input)
     e=environment(tmp_path)
     e.update(RSTATION_WORKER_GEMINI_BACKUP_API_KEY='backup',
@@ -345,7 +350,7 @@ print(json.dumps({'event':'result','result':{'conversation_id':'retained-gemini'
         assert m.launch_cli_job('gemini_1');drain(m)
         args=read(work/'args2.json')
         assert args[args.index('--conversation')+1]=='retained-gemini'
-        assert (work/'route2').read_text()=='http://127.0.0.1:2'
+        assert (work/'route2').read_text()=='http://127.0.0.1:1'
         assert m.states['gemini_1'].get('last_tool_completed')
         assert (work/'research.txt').read_text()=='preserved'
     finally:m.close()
@@ -432,10 +437,10 @@ while True:
             assert m.states[name]['token']=='retry-gemini'
             assert m.states[name]['gemini_recovery_route']==1
             # Bypass backoff only in this fixture; verify next real launch
-            # selects the other provider without replacing the conversation.
+            # retries this provider once without replacing the conversation.
             m.states[name]['next']=0
             assert m.launch_cli_job(name)
-            assert m.states[name]['route_index']==1
+            assert m.states[name]['route_index']==0
             assert m.states[name]['token']=='retry-gemini'
             assert m.states[name]['api_retries']==0
     finally:m.close()

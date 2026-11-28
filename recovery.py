@@ -140,7 +140,7 @@ class ResearchManager(CliJobManager):
             name=worker["name"];path=self.run/name/".runtime/state.json"
             state=read(path,{"spawn":0,"resumes":0,"token":None,"next":0,"launches":0,"route_count":0})
             if state.get("session_unavailable"):
-                state["token"]=None
+                if worker["kind"] != "gemini":state["token"]=None
             elif state.get("launches"):
                 transcript=self.run/name/".runtime"/f"launch_{state['launches']:06d}"/"transcript.jsonl"
                 recovered=self._get_cli_job_backend(worker["kind"]).extract_resume_token(str(transcript))
@@ -200,26 +200,38 @@ class ResearchManager(CliJobManager):
         count=decision.endpoint_resume_count or 0
         # Reconsider the preferred route only when launching a new native turn.
         # A small probe must never interrupt a productive backup conversation.
-        index=(w.get("route_seed",0)+self.states[name].get("route_offset",0)+count//2)%len(self.provider_pool(name))
-        recovery_route=self.states[name].pop("gemini_recovery_route",None)
-        from worker_control import selected_route
-        controlled=selected_route(self.states[name],None)
-        if controlled is not None:
-            index=controlled
-        elif w["kind"]=="gemini" and recovery_route is not None:
-            index=recovery_route%len(self.provider_pool(name))
-            self.states[name]["route_offset"]=index-w.get("route_seed",0)-count//2
-        elif index and not self.probe and not self._untried_session_routes(name) and self._primary_recovered(name):
-            index=0
-            self.states[name]["route_offset"]=-w.get("route_seed",0)-count//2
-            self.log(name,"Primary provider recovered; continuing the same conversation on provider 1.")
-        route=self.provider_pool(name)[index]
+        launch_pool = self.provider_pool(name)
+        if w["kind"] == "gemini":
+            from gemini_failover import begin, choose, eligible
+            launch_pool = eligible(self, name)
+            if self.probe:
+                index = w.get('route_seed', 0) % len(launch_pool)
+            else:
+                index = choose(self.states[name], launch_pool)
+                begin(self.states[name], launch_pool, index, w['model'])
+                self._provider_secrets.update(r['api_key'] for r in launch_pool)
+            route = launch_pool[index]
+        else:
+            index=(w.get("route_seed",0)+self.states[name].get("route_offset",0)+count//2)%len(launch_pool)
+            recovery_route=self.states[name].pop("gemini_recovery_route",None)
+            from worker_control import selected_route
+            controlled=selected_route(self.states[name],None)
+            if controlled is not None:
+                index=controlled
+            elif w["kind"]=="gemini" and recovery_route is not None:
+                index=recovery_route%len(launch_pool)
+                self.states[name]["route_offset"]=index-w.get("route_seed",0)-count//2
+            elif index and not self.probe and not self._untried_session_routes(name) and self._primary_recovered(name):
+                index=0
+                self.states[name]["route_offset"]=-w.get("route_seed",0)-count//2
+                self.log(name,"Primary provider recovered; continuing the same conversation on provider 1.")
+            route=launch_pool[index]
         self.states[name]["route_index"]=index
         # Model traffic is direct unless the run explicitly selects a proxy.
         # This also covers legacy run files with a missing/null setting.
         model_proxy=self.config.get("model_api_proxy") or "direct"
         if model_proxy=="direct":model_proxy=None
-        hosts={urlsplit(r["base_url"]).hostname for r in self.provider_pool(name)}
+        hosts={urlsplit(r["base_url"]).hostname for r in launch_pool}
         # Apply hostname-specific connectivity fixes on the next launch only;
         # existing native turns and their open connections remain untouched.
         configured=read(self.run/"run.json",self.config).get("model_api_host_proxies") or {}
@@ -249,19 +261,25 @@ class ResearchManager(CliJobManager):
                    TMPDIR=str(work/".tmp"),PATH=self.bin_paths[w["kind"]][1],PYTHONUNBUFFERED="1",
                    VIRTUAL_ENV=str(work/".venv"),CUDA_VISIBLE_DEVICES="",OMP_NUM_THREADS="5",OPENBLAS_NUM_THREADS="5",MKL_NUM_THREADS="5",
                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        env.pop("RSTATION_GEMINI_COMPACT",None)
         env.pop("RSTATION_WORKER_LIVE_INPUT",None)
         if self.config.get("live_input", False) and not self.probe:
             env["RSTATION_WORKER_LIVE_INPUT"]="1"
         env.update(proxy_env)
         env["PATH"]=str(work/".venv/bin")+":"+env["PATH"]
         for key in ("CONDA_PREFIX","CONDA_DEFAULT_ENV","PYTHONHOME"):env.pop(key,None)
-        direct_models = [urlsplit(r["base_url"]).hostname for r in self.provider_pool(name)
+        direct_models = [urlsplit(r["base_url"]).hostname for r in launch_pool
                          if urlsplit(r["base_url"]).hostname not in host_proxies] if not model_proxy else []
         bypass=",".join(dict.fromkeys(["localhost","127.0.0.1","::1"]+direct_models+([] if self.config.get("platform_proxy") else [urlsplit(self.config["url"]).hostname])))
         env.update(NO_PROXY=bypass,no_proxy=bypass)
         if w["kind"]=="codex":env.update(CODEX_API_KEY=route["api_key"],CODEX_BASE_URL=route["base_url"])
         elif w["kind"] == "gemini":
             env.update(GEMINI_API_KEY=route["api_key"],GOOGLE_GEMINI_BASE_URL=route["base_url"])
+            rotation = self.states[name].get('gemini_rotation', {})
+            if not self.probe and rotation.pop('compact_pending', False):
+                rotation['compact_launch'] = str(self.states[name]['launches'])
+                env['RSTATION_GEMINI_COMPACT'] = rotation['compact_launch']
+                self.persist(name)
             # Apply operator budget changes on the next launch without stopping
             # other researchers or their experiments in this running controller.
             context_tokens=int(read(self.run/"run.json",{}).get("gemini_context_tokens",
@@ -287,7 +305,7 @@ class ResearchManager(CliJobManager):
             prompt+="\nYour previous session was interrupted. Read CONTINUATION.md and your saved notes, reuse your account and workspace, and continue the existing research.\n"
             if claimed.get("session_recovery"):
                 prompt+="The preserved previous session state and continuation are in .runtime/session-recovery/. Check existing experiments before launching anything new.\n"
-        self.log(name,f"{'Resuming' if decision.is_resume else 'Starting'} {w['model']}; provider {index+1}/{len(self.provider_pool(name))}; {session_id}")
+        self.log(name,f"{'Resuming' if decision.is_resume else 'Starting'} {w['model']}; provider {index+1}/{len(launch_pool)}; {session_id}")
         return CliJobLaunchSpec(self.bin_paths[w["kind"]][0],str(work/".runtime"/session_id),w["kind"],w["model"],str(work),str(work),prompt,env,
                 network_access=not self.config.get("disable_web",False),
                 codex_config_overrides=('features.enable_request_compression=false',
@@ -416,6 +434,8 @@ class ResearchManager(CliJobManager):
     @serialize_failure
     def _schedule_cli_job_resume(self,name,session,failure):
         from worker_control import handle_failure
+        from gemini_failover import schedule
+        if schedule(self,name,session,failure):return
         if handle_failure(self,name,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
@@ -468,6 +488,8 @@ class ResearchManager(CliJobManager):
     @serialize_failure
     def _schedule_cli_job_fresh_attempt(self,name,session,failure):
         from worker_control import handle_failure
+        from gemini_failover import schedule
+        if schedule(self,name,session,failure):return
         if handle_failure(self,name,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
@@ -818,6 +840,9 @@ class ResearchManager(CliJobManager):
                 self.log(name,result["response"][-4000:])
             elif result.get("status")!="SUCCESS":
                 state["last_error"]="Antigravity turn ended: "+str(result.get("status","unknown"))
+
+        from gemini_failover import event_evidence
+        event_evidence(state,event,now)
 
     @classmethod
     def _transcript_has_normal_progress(cls,path):

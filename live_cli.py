@@ -319,6 +319,14 @@ class LiveCLI:
     def run(self):
         from gemini_stream import native_environment
         config, _ = self.run_config()
+        compact_launch = os.environ.pop('RSTATION_GEMINI_COMPACT', None)
+        if self.args.kind == 'gemini' and compact_launch:
+            from gemini_compaction import compact_once
+            if not compact_once(Path(self.args.workspace).resolve(), self.args.conversation,
+                                self.args.command, os.environ, compact_launch):
+                emit({'event': 'result', 'result': {'status': 'ERROR', 'error': 'native compaction failed',
+                      'conversation_id': self.args.conversation}})
+                return 1
         with native_environment(self.args.kind, config, os.environ) as environment:
             return self.run_native(environment)
 
