@@ -4,6 +4,7 @@ import json
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from antigravity import provider_account_error
 from common import ROOT, read
@@ -12,6 +13,14 @@ HTTP_STATUS = re.compile(r'(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\berror\s*:?\s*|\bstatu
 REFUSAL = re.compile(r'\b(refus(?:al|ed)|safety|safeguard|prohibited|permission.denied|policy violation|blocklist)\b', re.I)
 CONTEXT = re.compile(r'prompt (?:is )?too long|exceeds (?:the )?model.{0,90}context window|input token count.{0,60}exceeds', re.I)
 TRANSPORT = re.compile(r'\b(?:timed? ?out|deadline exceeded|connection (?:refused|reset)|unexpected eof|bad gateway|upstream unavailable|provider unavailable|service unavailable|resource.exhausted)\b', re.I)
+
+
+def invalid_tool_result(result):
+    """Match the provider's terminal protocol diagnostic, never a tool's output."""
+    return (result.get('status') == 'ERROR' and isinstance(result.get('error'), str)
+            and re.match(r'(?:agent executor error: generating and executing: )?'
+                         r'Error 400, Message: INVALID_TOOL_RESULT, Status: INVALID_ARGUMENT(?:,|$)',
+                         result['error']) is not None)
 
 
 def key_id(route):
@@ -181,10 +190,24 @@ def guard(manager, name):
     if any(value != sid for value in identities):
         block(manager, name, 'worker_control_conflict')
         return False
+    rotation = state.get('gemini_rotation', {})
+    if (state.get('blocked_reason') == 'gemini_unclassified_failure' and not hold
+            and not state.get('session_unavailable') and not state.get('pid')
+            and name not in manager.active_sessions and sid and rotation.get('session') == sid
+            and rotation.get('launch') == state.get('launches') and rotation.get('key')
+            and rotation.get('scheduled_launch') != state.get('launches')):
+        session = latest_launch(manager, name)
+        result = native_result(session)
+        if result.get('conversation_id') == sid and invalid_tool_result(result):
+            state.pop('blocked_reason')
+            if adoption.get('failure_category') == 'gemini_unclassified_failure':
+                adoption.update(status='pending')
+                adoption.pop('failure_category')
+            schedule(manager, name, session, SimpleNamespace(category='infra_transient', resume_token=sid))
     if (state.get('blocked_reason') == 'worker_control_failed' and sid and not state.get('session_unavailable')
             and hold.get('failure_category') in ('provider_unavailable', 'infra_transient', 'resume_limit_exceeded')):
         # Migrate only diagnosed interruptions; inconclusive legacy failures need review.
-        last = native_result_from_state(manager, name)
+        last = native_result(latest_launch(manager, name))
         diagnostic = str(last.get('error') or '')
         if (not REFUSAL.search(diagnostic) and not provider_account_error(last.get('response'))
                 and (hold['failure_category'] == 'provider_unavailable' or last.get('watchdog_interruption')
@@ -224,11 +247,10 @@ def guard(manager, name):
     return True
 
 
-def native_result_from_state(manager, name):
-    from types import SimpleNamespace
+def latest_launch(manager, name):
     launch = manager.states[name].get('launches', 0)
     path = manager.run/name/'.runtime'/f'launch_{launch:06d}'/'transcript.jsonl'
-    return native_result(SimpleNamespace(transcript_path=path))
+    return SimpleNamespace(transcript_path=path)
 
 
 def schedule(manager, name, session, failure):
@@ -277,7 +299,8 @@ def schedule(manager, name, session, failure):
     else:
         credential_failed = bool(http in (400, 401) and re.search(
             r'api.key (?:not valid|invalid|expired)|invalid api.key|unauthenticated', error, re.I))
-        outage = (credential_failed or failure.category == 'provider_unavailable' or http in (408, 429)
+        incompatible = invalid_tool_result(result)
+        outage = (incompatible or credential_failed or failure.category == 'provider_unavailable' or http in (408, 429)
                   or http is not None and 500 <= http <= 599 or TRANSPORT.search(error))
         interrupted = (failure.category == 'infra_transient' and (
             error.strip().lower() == 'interrupted' or result.get('watchdog_interruption') or
@@ -292,7 +315,7 @@ def schedule(manager, name, session, failure):
         observe(rotation, 'errors' if outage else 'interrupted', now, http)
         failures = rotation.get('failures', 0) + 1
         tried = [k for k in rotation.get('tried', []) if k in ids]
-        if failures == 1 and key in ids:
+        if failures == 1 and key in ids and not incompatible:
             following, delay = key, 10
         else:
             if key not in tried:

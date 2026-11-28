@@ -248,3 +248,27 @@ def test_real_agy_fails_primary_then_reads_with_backup(tmp_path, monkeypatch):
         for server in servers:
             server.shutdown()
             server.server_close()
+
+
+@pytest.mark.parametrize('mismatch',['sid','launch','unrelated','none'])
+def test_legacy_invalid_tool_result_rearms_exact_launch_once(tmp_path,mismatch):
+    m=Manager();m.run=tmp_path
+    state=m.states['w'];state.pop('worker_control')
+    state.update(launches=3079,blocked_reason='gemini_unclassified_failure')
+    g.begin(state,m.routes,0,'carbon')
+    rot=state['gemini_rotation']
+    message='agent executor error: generating and executing: Error 400, Message: INVALID_TOOL_RESULT, Status: INVALID_ARGUMENT, Details: []'
+    result={'conversation_id':'other' if mismatch=='sid' else 'saved','status':'ERROR',
+            'error':'Error 400: invalid argument' if mismatch=='unrelated' else message}
+    path=tmp_path/'w/.runtime/launch_003079/transcript.jsonl'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'event':'result','result':result}))
+    if mismatch=='launch':rot['launch']=3078
+    assert g.guard(m,'w') == (mismatch=='none')
+    if mismatch!='none':
+        assert state['blocked_reason']=='gemini_unclassified_failure' and 'observations' not in rot
+        return
+    assert rot['next_key']==g.key_id(m.routes[1])
+    assert rot['observations'][g.key_id(m.routes[0])]['http_status']==400
+    assert state['status']=='retrying' and state['token']=='saved'
+    assert g.guard(m,'w') and state['retry_total']==1
