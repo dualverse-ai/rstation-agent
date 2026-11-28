@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 import signal
 import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 import shutil
 import tempfile
@@ -122,7 +123,8 @@ class ClaudeResume(ClaudeCliWorkerBackend):
         except FileNotFoundError: pass
         return None
 
-from worker_control import serialize_failure
+from worker_control import (bind_fresh_session, control_lock, fresh_process_absent, fresh_start_failed, fresh_state_approval,
+                            recover_fresh_session, serialize_failure, sync_directory)
 
 class ResearchManager(CliJobManager):
     fresh_attempt_after_resume_exhaustion=True
@@ -139,7 +141,13 @@ class ResearchManager(CliJobManager):
         for worker in config["workers"]:
             name=worker["name"];path=self.run/name/".runtime/state.json"
             state=read(path,{"spawn":0,"resumes":0,"token":None,"next":0,"launches":0,"route_count":0})
-            if state.get("session_unavailable"):
+            if state.get('fresh_session'):
+                with control_lock(path.parent):
+                    state=read(path)
+                    approved_fresh=fresh_state_approval(path.parent,state)
+                    if approved_fresh and state['fresh_session']['phase'] == 'started' and fresh_process_absent(path.parent,state):
+                        recover_fresh_session(path.parent,state)
+            elif state.get("session_unavailable"):
                 if worker["kind"] != "gemini":state["token"]=None
             elif state.get("launches"):
                 transcript=self.run/name/".runtime"/f"launch_{state['launches']:06d}"/"transcript.jsonl"
@@ -148,10 +156,27 @@ class ResearchManager(CliJobManager):
             self.states[name]=state
             self._endpoint_resume_counts[name]=state.get("route_count",0)
             (self.run/name/".runtime").mkdir(parents=True,exist_ok=True,mode=0o700)
+            if state.get('fresh_session') and fresh_state_approval(path.parent,state) and state.get('status') in ('running', 'starting', 'blocked') and state.get('launches'):
+                self._recover_refusal(name, path.parent)
         self.last_storage=0
         if not probe:
             from provider_control import initialize
             initialize(self)
+
+    def _recover_refusal(self,name,folder):
+        state=self.states[name]
+        if state.get('blocked_reason') not in (None, 'fresh_session_unconfirmed'):
+            return
+        if not fresh_process_absent(folder,state):
+            return
+        launch=folder/f"launch_{state['launches']:06d}"
+        if state['fresh_session']['phase'] == 'ready':
+            return
+        observed=SimpleNamespace(backend='claude',transcript_path=str(launch/'transcript.jsonl'),
+                                 stderr_path=str(launch/'stderr.txt'),same_session_resume_disabled=False,
+                                 transcript_idle_timeout_reason=None)
+        failure=self._classify_cli_job_failure(name,observed)
+        self._block_model_refusal(name,failure)
 
     @staticmethod
     def _resume_backoff_schedule(): return BACKOFF
@@ -185,19 +210,49 @@ class ResearchManager(CliJobManager):
         s=self.states[name]
         return CliJobState(self.worker(name)["kind"],s["spawn"],s["resumes"],2**31,14,s.get("token"),s.get("next",0),
                            not s.get("token") and time.time()>=s.get("next",0),bool(s.get("token")))
+    def launch_cli_job(self,name):
+        folder=self.run/name/'.runtime'
+        with control_lock(folder):
+            try:
+                return super().launch_cli_job(name)
+            except Exception:
+                if fresh_start_failed(self.states[name]):
+                    self.persist(name)
+                    self.log(name,'Fresh Claude launch could not be confirmed; worker blocked.')
+                    return False
+                raise
+
     def _format_cli_job_session_id(self,name,state,decision):
-        return f"launch_{self.states[name]['launches']+1:06d}"
+        saved=self.states[name]
+        number=saved['launches']+1
+        if saved.get('fresh_session', {}).get('phase') == 'ready':
+            # A restored state file can predate an existing launch directory.
+            for path in (self.run/name/'.runtime').glob('launch_*'):
+                suffix=path.name.removeprefix('launch_')
+                if suffix.isdecimal():
+                    number=max(number,int(suffix)+1)
+        return f'launch_{number:06d}'
     def _claim_cli_job_launch(self,name,session_id,decision):
         from worker_control import guard_launch
         if self.states[name].get("blocked_reason") in {"model_refusal","claude_compaction_failed"} or not guard_launch(self,name):return None
         s=self.states[name]
         s.update(spawn=decision.spawn_count,resumes=decision.resume_count,launches=s["launches"]+1,
                  status="starting",route_count=decision.endpoint_resume_count or 0)
-        self.persist(name);return s
+        fresh=s.get('fresh_session', {})
+        if fresh.get('phase') == 'ready':
+            s['launches']=int(session_id.removeprefix('launch_'))
+            fresh.update(phase='started',launch=session_id)
+            self.persist(name)
+            sync_directory(self.run/name/'.runtime')
+        else:
+            self.persist(name)
+        return s
     def _build_cli_job_launch_spec(self,name,session_id,decision,claimed):
         w=self.worker(name);work=(self.run/name).resolve()
         for part in (".home",".codex",".claude",".cache",".tmp"): (work/part).mkdir(exist_ok=True)
         count=decision.endpoint_resume_count or 0
+        fresh=claimed.get('fresh_session', {})
+        explicit_fresh=fresh.get('phase')=='started' and not decision.is_resume
         # Reconsider the preferred route only when launching a new native turn.
         # A small probe must never interrupt a productive backup conversation.
         launch_pool = self.provider_pool(name)
@@ -216,7 +271,9 @@ class ResearchManager(CliJobManager):
             recovery_route=self.states[name].pop("gemini_recovery_route",None)
             from worker_control import selected_route
             controlled=selected_route(self.states[name],None)
-            if controlled is not None:
+            if explicit_fresh:
+                index=fresh['route']-1
+            elif controlled is not None:
                 index=controlled
             elif w["kind"]=="gemini" and recovery_route is not None:
                 index=recovery_route%len(launch_pool)
@@ -234,7 +291,8 @@ class ResearchManager(CliJobManager):
         hosts={urlsplit(r["base_url"]).hostname for r in launch_pool}
         # Apply hostname-specific connectivity fixes on the next launch only;
         # existing native turns and their open connections remain untouched.
-        configured=read(self.run/"run.json",self.config).get("model_api_host_proxies") or {}
+        current = self.config if explicit_fresh else read(self.run/'run.json',self.config)
+        configured=current.get("model_api_host_proxies") or {}
         if (not isinstance(configured,dict) or
                 any(not isinstance(host,str) or not isinstance(proxy,str) for host,proxy in configured.items())):
             raise ValueError("Model host proxies must map hostnames to HTTP(S) proxy URLs.")
@@ -269,6 +327,10 @@ class ResearchManager(CliJobManager):
             self.persist(name)
         env.pop("RSTATION_GEMINI_COMPACT",None)
         env.pop("RSTATION_WORKER_LIVE_INPUT",None)
+        env.pop('RSTATION_FRESH_START',None)
+        env.pop('RSTATION_FRESH_NATIVE_ID',None)
+        if explicit_fresh:
+            env.update(RSTATION_FRESH_START=fresh['id'],RSTATION_FRESH_NATIVE_ID=fresh['native_id'])
         if self.config.get("live_input", False) and not self.probe:
             env["RSTATION_WORKER_LIVE_INPUT"]="1"
         env.update(proxy_env)
@@ -303,11 +365,12 @@ class ResearchManager(CliJobManager):
                        CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="1",CLAUDE_CODE_SUBAGENT_MODEL=w["model"],
                        CLAUDE_CODE_EFFORT_LEVEL=reasoning_effort("claude",w["model"]))
         from capabilities import install_skills
-        current=read(self.run/'run.json',self.config)
         current_worker=next((v for v in current.get('workers',[]) if v['name']==w['name']),w)
         if not self.probe:install_skills(self.run,current,current_worker)
+        if explicit_fresh:
+            current={k:v for k,v in current.items() if k!='replacement_first_instruction'}
         prompt="Reply exactly Hello. Do not use tools." if self.probe else "Continue your research." if decision.is_resume else initial_prompt(current,current_worker,work)
-        if not self.probe and not decision.is_resume and claimed["launches"]>1:
+        if not self.probe and not decision.is_resume and not explicit_fresh and claimed["launches"]>1:
             prompt+="\nYour previous session was interrupted. Read CONTINUATION.md and your saved notes, reuse your account and workspace, and continue the existing research.\n"
             if claimed.get("session_recovery"):
                 prompt+="The preserved previous session state and continuation are in .runtime/session-recovery/. Check existing experiments before launching anything new.\n"
@@ -402,6 +465,8 @@ class ResearchManager(CliJobManager):
             if "workspace-write" in command:command[command.index("workspace-write")]="danger-full-access"
             prepared=replace(prepared,command=command)
         native_binary = prepared.command[0]
+        if spec.env.get('RSTATION_FRESH_NATIVE_ID'):
+            prepared=replace(prepared,command=[*prepared.command,'--session-id',spec.env['RSTATION_FRESH_NATIVE_ID']])
         if spec.env.get("RSTATION_WORKER_LIVE_INPUT")=="1":
             command=[sys.executable,str(ROOT/"live_cli.py"),"--kind",spec.backend,
                      "--workspace",spec.workspace_root,"--prompt-file",str(Path(spec.run_dir)/"prompt.txt"),
@@ -416,6 +481,19 @@ class ResearchManager(CliJobManager):
     def _mark_cli_job_pid(self,name,pid):
         self.states[name].update(pid=pid,pid_token=pid_token(pid),last_process_group=pid,status="running",started=time.time())
         self.persist(name)
+    def _terminate_cli_job_process(self,session,*,force=False):
+        work=Path(session.run_dir).parent.parent
+        state=self.states.get(work.name,{})
+        # The first fresh launch owns one live wrapper. Let its shutdown
+        # handler clean up Claude without signalling the launch group.
+        if state.get('fresh_session', {}).get('launch') == session.session_id:
+            if session.process.poll() is None:
+                try:
+                    (session.process.kill if force else session.process.terminate)()
+                except ProcessLookupError:
+                    pass
+            return
+        super()._terminate_cli_job_process(session,force=force)
     def _on_cli_job_process_exited(self,name,session,code):
         # A process can write its final events after the poll's first read.
         # Drain unread bytes before classifying failure or recording success.
@@ -440,7 +518,11 @@ class ResearchManager(CliJobManager):
         return False
     def _on_cli_job_completed(self,name,session,code):
         s=self.states[name]
-        token=self._get_cli_job_backend(session.backend).extract_resume_token(session.transcript_path)
+        if fresh_start_failed(s):
+            s['pid']=None
+            self.persist(name)
+            return
+        token=s.get('token') if s.get('fresh_session') else self._get_cli_job_backend(session.backend).extract_resume_token(session.transcript_path)
         # Keep the successful endpoint for subsequent conversations.
         index=s.get("route_index",0);seed=self.worker(name).get("route_seed",0)
         s.update(token=token or s.get("token"),resumes=0,next=time.time()+5,status="probe_ok" if self.probe else "continuing",
@@ -462,6 +544,7 @@ class ResearchManager(CliJobManager):
         from worker_control import handle_failure
         from gemini_failover import schedule
         if schedule(self,name,session,failure):return
+        if self._schedule_explicit_fresh_compaction(name,session,failure):return
         if handle_failure(self,name,failure):return
         if self._block_model_refusal(name,failure):return
         from claude_compaction import schedule as schedule_compaction
@@ -528,6 +611,7 @@ class ResearchManager(CliJobManager):
         from worker_control import handle_failure
         from gemini_failover import schedule
         if schedule(self,name,session,failure):return
+        if self._schedule_explicit_fresh_compaction(name,session,failure):return
         if handle_failure(self,name,failure):return
         if self._block_model_refusal(name,failure):return
         from claude_compaction import schedule as schedule_compaction
@@ -547,6 +631,12 @@ class ResearchManager(CliJobManager):
         s.update(token=None,resumes=0,next=time.time()+min(300,10*max(1,s["spawn"])),status="retrying",pid=None,
                  route_offset=s.get("route_offset",0)+1)
         self.persist(name);self.log(name,"Saved session unavailable; a fresh session will reuse this workspace and account.")
+    def _schedule_explicit_fresh_compaction(self,name,session,failure):
+        if self.states[name].get('fresh_session', {}).get('phase') != 'bound':
+            return False
+        from claude_compaction import schedule
+        return schedule(self,name,session,failure)
+
     def _on_cli_job_attempts_exhausted(self,name,session,failure):
         self._schedule_cli_job_fresh_attempt(name,session,failure)
 
@@ -796,7 +886,12 @@ class ResearchManager(CliJobManager):
                     if session.backend == "gemini":
                         token = e.get("conversation_id") or e.get("step_update",{}).get("conversation_id") or e.get("result",{}).get("conversation_id")
                         self._record_gemini_event(name,e,now)
-                    if token:state["token"]=token
+                    if state.get('fresh_session'):
+                        if bind_fresh_session(state,session.session_id,e):
+                            self.persist(name)
+                            sync_directory(self.run/name/'.runtime')
+                    elif token:
+                        state["token"]=token
                     # Record native retries without treating them as research
                     # progress or interrupting the CLI's own recovery cycle.
                     codex_retry=session.backend=="codex" and e.get("type")=="error"
@@ -895,10 +990,7 @@ class ResearchManager(CliJobManager):
     def pause_worker(self,name):
         session=self.active_sessions.pop(name,None)
         if session:
-            token=self._get_cli_job_backend(session.backend).extract_resume_token(session.transcript_path)
-            if token:self.states[name]["token"]=token
-            self._abort_cli_job_process(session)
-            self._close_cli_job_session_handles(session)
+            self._finish_interrupted_cli(name,session)
         self.states[name].update(pid=None,status="paused")
         self.persist(name)
 
@@ -916,9 +1008,18 @@ class ResearchManager(CliJobManager):
             (work/"STORAGE_USAGE.txt").write_text(text)
     def close(self):
         for name,session in list(self.active_sessions.items()):
-            token=self._get_cli_job_backend(session.backend).extract_resume_token(session.transcript_path)
-            if token:self.states[name]["token"]=token
-            self._abort_cli_job_process(session);self._close_cli_job_session_handles(session)
+            self._finish_interrupted_cli(name,session)
             self.states[name].update(pid=None,status="stopped");self.persist(name)
         self.active_sessions.clear()
         for router in [*self.routers.values(), *getattr(self,"_provider_retired_routers",[])]:router.__exit__(None,None,None)
+
+    def _finish_interrupted_cli(self,name,session):
+        self._abort_cli_job_process(session)
+        self._close_cli_job_session_handles(session)
+        state=self.states[name]
+        if state.get('fresh_session'):
+            recover_fresh_session(self.run/name/'.runtime',state)
+            self._block_model_refusal(name,self._classify_cli_job_failure(name,session))
+        else:
+            token=self._get_cli_job_backend(session.backend).extract_resume_token(session.transcript_path)
+            if token:state['token']=token

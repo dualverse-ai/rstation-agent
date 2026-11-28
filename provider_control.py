@@ -135,6 +135,16 @@ def require_no_pending(run,name):
         raise ValueError('Finish the pending worker or session-adoption request first.')
 
 
+def provider_update_pending(run, name, state):
+    record = registry(run)['workers'].get(name)
+    return bool(record and record['revision'] not in (meta(state).get('revision'), meta(state).get('rejected_revision')))
+
+
+def require_provider_current(run, name, state):
+    if provider_update_pending(run, name, state):
+        raise ValueError('Finish the pending provider update first.')
+
+
 def probe(config,worker,entries,environment):
     """One exact route/model per disposable native conversation; no saved research input."""
     from recovery import ResearchManager
@@ -181,6 +191,8 @@ def apply(run,entries,*,expected_revision,environment,worker=None,family=None,va
         for w in targets:
             name=w['name'];require_no_pending(run,name)
             state=read(run/name/'.runtime/state.json',{})
+            if state.get('fresh_session', {}).get('phase') in ('ready', 'started'):
+                raise ValueError('Finish the fresh conversation launch first.')
             if not meta(state).get('pool_sha256'): raise ValueError('Controller has not loaded provider-update support.')
             old=operator_pool(run,name,state,environment)
             if fingerprint(old)!=meta(state)['pool_sha256']: raise ValueError('Operator profile differs from the worker profile.')
@@ -266,6 +278,9 @@ def refresh(manager,name):
 
 def guard_session(manager,name):
     state=manager.states[name];saved=meta(state).get('session_id')
+    if state.get('fresh_session'):
+        control=state.get('worker_control', {})
+        saved=control.get('session_id')
     if meta(state).get('revision') and saved and (state.get('token') != saved or state.get('session_unavailable')):
         state.update(token=saved,status='blocked',blocked_reason='provider_session_conflict')
         state['worker_control_hold']={'session_id':saved,'failure_category':'session_unavailable'}
@@ -274,6 +289,10 @@ def guard_session(manager,name):
 
 def failure_control(manager,name):
     state=manager.states[name]
+    if state.get('fresh_session'):
+        # The registry's expected SID belongs to the provider transaction;
+        # the worker control record owns the replacement conversation.
+        return state.get('worker_control')
     data=meta(state)
     record=registry(manager.run)['workers'].get(name,{})
     sid=data.get('session_id') if data.get('revision') else record.get('expected',{}).get('session_id')

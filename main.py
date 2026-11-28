@@ -540,7 +540,9 @@ def main(argv=None):
             return
         if args.command=="pause":
             if args.worker not in {w["name"] for w in config["workers"]}:raise ValueError("Worker not found.")
-            (run/args.worker/".runtime/PAUSE").touch()
+            from worker_control import control_lock
+            folder=run/args.worker/".runtime"
+            with control_lock(folder):(folder/"PAUSE").touch()
             print("Pause requested; the workspace and conversation are preserved.")
         elif args.command=="stop":stop(run)
         elif args.command=="attach":
@@ -551,7 +553,9 @@ def main(argv=None):
                 ctl=read(run/"controller.json",{})
                 if not alive(ctl.get("pid"),ctl.get("token")):raise ValueError("Resume the group first, then resume this worker.")
                 if args.worker not in {w["name"] for w in config["workers"]}:raise ValueError("Worker not found.")
-                (run/args.worker/".runtime/PAUSE").unlink(missing_ok=True)
+                from worker_control import control_lock
+                folder=run/args.worker/".runtime"
+                with control_lock(folder):(folder/"PAUSE").unlink(missing_ok=True)
                 print("Worker resume requested.")
                 return
             ctl=read(run/"controller.json",{})

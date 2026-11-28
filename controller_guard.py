@@ -18,7 +18,7 @@ from live_watchdog import descendants, group_has_work, process
 
 def code_revision():
     digest = hashlib.sha256()
-    for name in ('main.py', 'recovery.py', 'gemini_failover.py', 'gemini_compaction.py', 'claude_compaction.py', 'worker_control.py', 'provider_control.py', 'live_cli.py', 'controller_guard.py', 'capabilities.py', 'coder.py', 'coder_service.py', 'coder_workspace.py', 'council.py', 'council_service.py', 'antigravity.py'):
+    for name in ('main.py', 'recovery.py', 'gemini_failover.py', 'gemini_compaction.py', 'claude_compaction.py', 'worker_control.py', 'fresh_approval.py', 'provider_control.py', 'live_cli.py', 'messages.py', 'controller_guard.py', 'capabilities.py', 'coder.py', 'coder_service.py', 'coder_workspace.py', 'council.py', 'council_service.py', 'antigravity.py'):
         digest.update((ROOT/name).read_bytes())
     return digest.hexdigest()[:16]
 
@@ -78,6 +78,15 @@ def reclaim_idle_clis(run, config):
     """Fence orphan CLIs together, and never signal a live research tool."""
     frozen = []
     try:
+        from worker_control import fresh_process_absent, fresh_state_approval, read_request
+        for worker in config['workers']:
+            folder = run/worker['name']/'.runtime'
+            state = read(folder/'state.json', {})
+            request = read_request(folder) or {}
+            if (request.get('spec', {}).get('action') == 'fresh' or
+                    (fresh_state_approval(folder, state) and state['fresh_session']['phase'] == 'started')):
+                if not fresh_process_absent(folder, state, request.get('process_group')):
+                    return False
         for worker in config['workers']:
             state = read(run/worker['name']/'.runtime/state.json', {})
             pid = state.get('pid')

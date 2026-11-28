@@ -67,8 +67,10 @@ class Messages:
     def list(self):
         return read(self.path, {'messages': []})['messages']
 
-    def pending(self):
-        queued = [m for m in self.list() if m['status'] == 'queued']
+    def pending(self, *, conversation=None):
+        queued = [m for m in self.list() if m['status'] == 'queued' and
+                  (conversation is None or m.get('conversation') == conversation or
+                   not any(key in m for key in ('sent_at', 'received_at', 'first_received_at')))]
         # Supervisor mailbox notifications can accumulate while a researcher is
         # busy. Direct operator input must not wait behind that backlog. These
         # keys are set by the mailbox/scheduler, never inferred from message text
@@ -77,24 +79,26 @@ class Messages:
         return sorted(queued, key=lambda m: m.get('delivery_key', '').startswith(
             ('supervision:', 'supervision-reflection:')))
 
-    def mark(self, numbers, status):
+    def mark(self, numbers, status, *, conversation=None):
         if not numbers:
             return
         def update(data):
             for message in data['messages']:
                 if message['id'] in numbers and message['status'] != 'delivered':
                     stamp = now()
+                    if status == 'sent' and conversation is not None:
+                        message['conversation'] = conversation
                     if status == 'received':
                         message.setdefault('first_received_at', message.get('received_at', stamp))
                     message.update(status=status, **{status + '_at': stamp})
         self._update(update)
 
-    def recover(self):
+    def recover(self, *, conversation=None):
         # A crashed CLI may have read an instruction without finishing its turn.
         # Re-send it in the saved conversation rather than silently losing it.
         def reset(data):
             for message in data['messages']:
-                if message['status'] in {'sent', 'received'}:
+                if message['status'] in {'sent', 'received'} and message.get('conversation') == conversation:
                     message['status'] = 'queued'
         self._update(reset)
 

@@ -74,3 +74,25 @@ Each researcher loads the validated list on its next native client launch, witho
 The launcher stores the validated routes in private operator storage under the run, separate from worker state and receipts. Restarted controllers recover the active provider revision from that storage. Editing a shell profile alone does not change running clients. Updates cover the named research workers; coder and council provider settings remain separate.
 
 For original or verified relayed owner instructions, use [owner message history](owner-messages.md) to record received messages for later reference.
+## Start a fresh Claude conversation in an existing slot
+
+Use the launcher revision that the running controller has loaded. Read the slot's current `session_id` and `revision`, then generate a UUID for the operation.
+
+```sh
+./agents worker RUN claude_1 status
+./agents worker RUN claude_1 fresh --expect-session SID --expect-revision REVISION --request-id UUID > proposal.json
+sudo /usr/bin/python3 -I /trusted/launcher/fresh_approval.py < proposal.json
+./agents worker RUN claude_1 status
+```
+
+The first command shows the saved identity. The `fresh` command prepares a proposal under the researcher account. Before signing off, the root operator reviews the exact proposal bytes and verifies the intended worker, workspace path and inode, old session and revision, model, and provider route. Pass the reviewed bytes from an operator-controlled copy to the approval command. Run the approval script from a root-controlled installation. Provision `/var/lib/rstation-worker-control/approvals` as root with mode `0755` and root-owned ancestors that deny group and other writes. The approval script writes a root-owned `0444` record and reserves one native SID. Retain that record while the slot uses the conversation. Approval has no time expiry. Removing the approval before launch cancels authorization and removing it later blocks the guarded slot until it is restored.
+
+The approval authenticates the supported fresh operation. On H6 the controller and researcher share UID/GID 2001, and that UID can replace launcher files through writable parents and modify its venv. It can also change its runtime files or run a separate CLI. Use a separate root-controlled directory and `/usr/bin/python3 -I` for the standalone issuer. The immutable approval restricts an old request UUID to its original native SID even if writable receipts are removed.
+
+For a disposable permission check, review `tests/probe_fresh_approval_permissions.py` and `fresh_approval.py` before placing them together in a separate root-controlled directory that UID/GID 2001 can traverse. Run `sudo /usr/bin/python3 -I /trusted/probe/probe_fresh_approval_permissions.py --uid 2001 --gid 2001`. The probe uses a synthetic proposal in a temporary `/var/lib` directory and removes that directory on exit.
+
+The Claude slot must have live input enabled. Wait for its wrapper, native CLI and their process group to exit. A live or reused PID blocks the request. Independent GPU helpers and drivers can stay running. A `PAUSE` or `STOP` marker holds a pending request and prevents a fresh launch. A pending provider change, adoption or worker request must finish first.
+
+Reuse the same UUID and expected values when checking or retrying submission. `receipt.status=applied` means the controller archived the old state and committed the transition. `fresh_session.phase=bound` means Claude reported the reserved new ID. An unconfirmed launch blocks the slot for review and consumes the single launch attempt. If the controller crashes before observing the new ID, recovery waits for the outstanding wrapper and its process group to exit. It then checks only that launch's transcript for the reserved ID.
+
+The worker keeps its effective model, provider and account configuration, context settings, and workspace. The controller archives the previous state in the slot's private runtime directory and leaves native stores, prior transcripts, research files and GPU reservations in place. Fresh startup uses the standard research assignment and queued, previously undispatched mail. Previously dispatched messages stay in history. Subsequent launches resume the new conversation.

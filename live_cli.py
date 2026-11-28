@@ -53,7 +53,12 @@ class LiveCLI:
     def __init__(self, args):
         self.args = args
         self.messages = Messages(args.workspace)
-        self.messages.recover()
+        state = read(Path(args.workspace) / '.runtime/state.json', {})
+        from worker_control import fresh_state_approval
+        approval = fresh_state_approval(Path(args.workspace) / '.runtime', state)
+        self.mail_conversation = approval['request']['id'] if approval else None
+        if not os.environ.get('RSTATION_FRESH_START'):
+            self.messages.recover(conversation=self.mail_conversation)
         self.events = queue.Queue()
         self.output = bytearray()
         self.sent = {}  # message number -> text, only for this native process
@@ -165,7 +170,7 @@ class LiveCLI:
             self.busy = True
         if number is not None:
             self.sent[number] = text
-            self.messages.mark([number], 'sent')
+            self.messages.mark([number], 'sent', conversation=self.mail_conversation)
 
     def send_pending(self, messages, initial_prompt=None):
         # Claude and Antigravity read instructions at turn boundaries. Carry a
@@ -186,7 +191,7 @@ class LiveCLI:
             numbers = tuple(number for number, _ in batch)
             self.inputs[-1] = numbers
             self.sent.update({number: text for number in numbers})
-            self.messages.mark(list(numbers), 'sent')
+            self.messages.mark(list(numbers), 'sent', conversation=self.mail_conversation)
 
     def accepted(self, number):
         if number is not None:
@@ -337,9 +342,18 @@ class LiveCLI:
             return self.run_native(environment)
 
     def run_native(self, environment=None):
+        fresh_start = os.environ.pop('RSTATION_FRESH_START', None)
+        if self.args.kind == 'claude' and '--session-id' in self.args.command and not fresh_start:
+            raise RuntimeError('Fresh conversation launch is no longer authorized.')
+        if fresh_start:
+            from worker_control import validate_fresh_wrapper
+            validate_fresh_wrapper(self.args.workspace, fresh_start, self.args.model,
+                                   self.args.command, self.args.kind, self.args.conversation)
         if self.args.kind == 'gemini':
             refresh_context_budget(self.args.workspace, self.args.model)
         native = native_command(self.args.kind, self.args.command)
+        if fresh_start and environment is not None:
+            environment = {key: value for key, value in environment.items() if key != 'RSTATION_FRESH_START'}
         self.child = subprocess.Popen(native, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True, bufsize=1, env=environment)
         info = Path(self.args.workspace) / '.runtime/live_input.json'
@@ -355,7 +369,7 @@ class LiveCLI:
         if self.args.kind == 'codex':
             self.request('initialize', {'clientInfo': {'name': 'rstation_workers', 'version': '0.1.0'}})
         else:
-            pending = self.messages.pending()
+            pending = self.messages.pending(conversation=self.mail_conversation)
             if pending:
                 # Fresh sessions still need the complete task, together with
                 # queued guidance, before their first potentially long turn.
@@ -415,7 +429,7 @@ class LiveCLI:
                 # Long messages cannot block output, tools or the controller.
                 preference_wait = self.args.kind == 'claude' and self.claude_preference.waiting()
                 if ready and not self.output and not input_closed and not preference_wait:
-                    pending = self.messages.pending()
+                    pending = self.messages.pending(conversation=self.mail_conversation)
                     if pending and self.can_send_message(pending[0]):
                         if self.is_supervisor:
                             from supervision import wake
