@@ -303,6 +303,13 @@ CREATE INDEX IF NOT EXISTS samples_at ON samples(at);
    canonical=canonical_key_name(info.get('label'))
    if canonical:k['labels'].add(canonical)
    k['hosts'].add(host);k['families'].add(info['family']);k['sampled_at']=max(k['sampled_at'],at)
+  # Installation profiles may supply an authorized backup missing from a worker's legacy key inventory.
+  for row in rows:
+   if row.get('intentional_stop') or not 0<=now-row.get('sampled_at',0)<=300:continue
+   for ident in row.get('gemini_enabled',[]):
+    if ident in keys:
+     keys[ident]['hosts'].add(row['host'])
+     keys[ident]['policy'].add(True)
   for ident,k in keys.items():
    flags=k.pop('policy')
    enabled=True if True in flags else False if False in flags else None

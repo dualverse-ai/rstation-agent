@@ -77,3 +77,28 @@ def test_first_live_attempt_is_distinguishable_from_an_unused_route():
                process_alive=True,last_response=19000)
     assert key_observation('a',[active],20000,True)['status']=='attempting'
     assert key_observation('b',[active],20000,True)['status']=='untried'
+
+
+def test_retired_inventory_uses_current_host_policy(tmp_path,monkeypatch):
+    import fleet_collect as fc
+    enabled='a'*64
+    active=tmp_path/'active'
+    retired=tmp_path/'retired'
+    (active/'agent_data').mkdir(parents=True)
+    (active/'gemini-routing.json').write_text(json.dumps(dict(enabled=[enabled])))
+    run=retired/'agent_data/old';run.mkdir(parents=True)
+    (run/'STOP').touch()
+    (run/'run.json').write_text(json.dumps(dict(workers=[dict(kind='gemini',name='gemini_1')])))
+    monkeypatch.setattr(fc,'worker_key_inventory',lambda *a:([dict(id='b'*64,name='Gemini backup 1',family='gemini')],None))
+    data=fc.collect([active,retired],'h4')
+    assert data['provider_keys'][0]['enabled'] is False
+
+
+def test_enabled_host_report_includes_backup_inventory_from_other_installation(tmp_path):
+    store=Store(tmp_path/'db')
+    key='a'*64
+    store.record(dict(host='h4',sampled_at=20000,workers=[],provider_keys=[
+        dict(id=key,name='Gemini backup 1',family='gemini',endpoint='https://example',enabled=False)]))
+    store.record(dict(host='h6',sampled_at=20000,workers=[row(host='h6',gemini_enabled=[key])],provider_keys=[]))
+    item=store.view(20000)['provider_keys'][0]
+    assert item['status']=='untried' and item['hosts']==['h4','h6']

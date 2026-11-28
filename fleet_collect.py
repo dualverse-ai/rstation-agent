@@ -465,10 +465,11 @@ def rotation_observation(rotation):
 
 
 def collect(roots,host):
- now=time.time();rows=[];failures=[];inventory={}
+ now=time.time();rows=[];failures=[];inventory={};host_enabled=set()
  for root in roots:
   root=Path(root);data=root/'agent_data';profile_env=profile_environment(root)
   allowed=read(root/'gemini-routing.json').get('enabled')
+  if isinstance(allowed,list):host_enabled.update(k for k in allowed if isinstance(k,str) and re.fullmatch('[0-9a-f]{64}',k))
   key_labels=read(root/'.provider-labels.json').get('labels',{})
   if not data.is_dir():failures.append('missing_root');continue
   for config_path in sorted(data.glob('*/run.json')):
@@ -536,6 +537,11 @@ def collect(roots,host):
      if native_live and not paused and not stopped:
       row['gemini_tool_observation']=gemini_tool_observation(runtime,state)
     rows.append(row)
+ # Historical roots can contribute key labels even when all of their runs are retired.
+ # Apply the current host policy to those identities without treating a retired configuration as enabled.
+ for key in inventory.values():
+  if host_enabled and key['family']=='gemini' and 'enabled' not in key:
+   key['enabled']=key['id'] in host_enabled
  return {'host':host,'sampled_at':now,'workers':rows,'errors':failures,'provider_keys':list(inventory.values())}
 
 
