@@ -272,3 +272,29 @@ def test_legacy_invalid_tool_result_rearms_exact_launch_once(tmp_path,mismatch):
     assert rot['observations'][g.key_id(m.routes[0])]['http_status']==400
     assert state['status']=='retrying' and state['token']=='saved'
     assert g.guard(m,'w') and state['retry_total']==1
+
+
+@pytest.mark.parametrize(('http','message','category','outcome'),[
+    (400,'{"error":"模型已停用，请选择其他模型"}','infra_transient','rotate'),
+    (404,'models/carbon is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.','infra_transient','rotate'),
+    (404,'{"error":{"message":"Model carbon not found"}}','infra_transient','rotate'),
+    (404,'models/different-model not found','infra_transient','gemini_unclassified_failure'),
+    (404,'session not found','session_unavailable','session_unavailable'),
+    (404,'model safety refusal','model_refusal','model_refusal'),
+    (404,'tool result mentions model not found','infra_transient','gemini_unclassified_failure')])
+def test_model_unavailable_is_a_route_failure_only(tmp_path,http,message,category,outcome):
+    m=Manager(); m.run=tmp_path
+    state=m.states['w']; state.update(launches=3424)
+    g.begin(state,m.routes,0,'carbon')
+    path=tmp_path/'transcript.jsonl'
+    result=dict(status='ERROR',conversation_id='saved',
+                error=f'agent executor error: generating and executing: Error {http}, Message: {message}, Status: {http} Bad Request, Details: []')
+    path.write_text(json.dumps({'event':'result','result':result}))
+    assert g.schedule(m,'w',SimpleNamespace(transcript_path=path),SimpleNamespace(category=category,resume_token='saved'))
+    rot=state['gemini_rotation']
+    if outcome=='rotate':
+        assert rot['next_key']==g.key_id(m.routes[1])
+        assert rot['observations'][g.key_id(m.routes[0])]['http_status']==http
+        assert state['token']=='saved' and rot['model']=='carbon'
+    else:
+        assert state['blocked_reason']==outcome and 'observations' not in rot

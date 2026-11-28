@@ -23,6 +23,34 @@ def invalid_tool_result(result):
                          result['error']) is not None)
 
 
+def model_unavailable(result, model):
+    if result.get('status') != 'ERROR' or not isinstance(result.get('error'), str):
+        return False
+    native = re.match(r'(?:agent executor error: generating and executing: )?'
+                      r'Error (400|404), Message: (.*?), Status: ', result['error'])
+    if not native:
+        return False
+    status, message = native.groups()
+    if message.startswith('{'):
+        try:
+            payload = json.loads(message)
+        except ValueError:
+            return False
+        message = payload.get('error')
+        if isinstance(message, dict):
+            message = message.get('message')
+        if not isinstance(message, str):
+            return False
+    if status == '400':
+        return message == '模型已停用，请选择其他模型'
+    requested = re.escape(model.removeprefix('gemini-api://'))
+    return bool(re.fullmatch(r'(?:model not found|(?:models/|model (?:models/)?)' + requested +
+                             r' (?:is |was )?not found(?: for API version [a-z0-9]+'
+                             r'(?:, or is not supported for generateContent)?(?:\. Call ListModels'
+                             r' to see the list of available models and their supported methods)?)?)\.?',
+                             message, re.I))
+
+
 def key_id(route):
     identity = route['base_url'].rstrip('/') + '\0' + route['api_key']
     return hashlib.sha256(identity.encode()).hexdigest()
@@ -198,7 +226,7 @@ def guard(manager, name):
             and rotation.get('scheduled_launch') != state.get('launches')):
         session = latest_launch(manager, name)
         result = native_result(session)
-        if result.get('conversation_id') == sid and invalid_tool_result(result):
+        if result.get('conversation_id') == sid and (invalid_tool_result(result) or model_unavailable(result, rotation['model'])):
             state.pop('blocked_reason')
             if adoption.get('failure_category') == 'gemini_unclassified_failure':
                 adoption.update(status='pending')
@@ -299,7 +327,7 @@ def schedule(manager, name, session, failure):
     else:
         credential_failed = bool(http in (400, 401) and re.search(
             r'api.key (?:not valid|invalid|expired)|invalid api.key|unauthenticated', error, re.I))
-        incompatible = invalid_tool_result(result)
+        incompatible = invalid_tool_result(result) or model_unavailable(result, rotation['model'])
         outage = (incompatible or credential_failed or failure.category == 'provider_unavailable' or http in (408, 429)
                   or http is not None and 500 <= http <= 599 or TRANSPORT.search(error))
         interrupted = (failure.category == 'infra_transient' and (
