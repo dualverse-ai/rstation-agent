@@ -69,6 +69,8 @@ class LiveCLI:
         self.requests = {}
         self.child = None
         self.gemini_events = []
+        from claude_preference import Preference
+        self.claude_preference = Preference()
         self.is_supervisor = read(Path(args.workspace) / '.runtime/supervision.json', {}).get('supervisor', False)
         self.startup_prompt = None
         config, self.run_worker = self.run_config()
@@ -279,6 +281,8 @@ class LiveCLI:
 
     def stream_event(self, event):
         emit(event)
+        if self.args.kind == "claude":
+            self.claude_preference.observe(event)
         # Retry notices and tool heartbeats are not model progress.
         step = event.get('step_update', {})
         if (event.get('type') in {'assistant', 'user', 'stream_event', 'result'}
@@ -312,9 +316,11 @@ class LiveCLI:
                     if text == content:
                         self.accepted(number)
             if event.get('type') == 'result':
-                if event.get('is_error') or event.get('subtype') != 'success':
+                if event.get('is_error') or event.get('subtype') != 'success' or event.get('stop_reason') == 'refusal':
                     raise RuntimeError('Claude turn failed')
                 self.finish()
+                selection = self.claude_preference.select(self.args.model, idle=not self.busy and not self.output)
+                if selection:self.write(selection)
 
     def run(self):
         from gemini_stream import native_environment
@@ -407,7 +413,8 @@ class LiveCLI:
                     continue
                 ready = self.args.kind != 'codex' or (self.thread is not None and (not self.busy or self.turn is not None))
                 # Long messages cannot block output, tools or the controller.
-                if ready and not self.output and not input_closed:
+                preference_wait = self.args.kind == 'claude' and self.claude_preference.waiting()
+                if ready and not self.output and not input_closed and not preference_wait:
                     pending = self.messages.pending()
                     if pending and self.can_send_message(pending[0]):
                         if self.is_supervisor:
