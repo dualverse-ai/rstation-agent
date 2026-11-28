@@ -14,7 +14,7 @@ function age(ts){if(!ts)return 'Unknown';const n=Math.max(0,snapshot.now-ts);ret
 function timeCell(ts){const td=node('td',age(ts));if(ts)td.title=new Date(ts*1000).toLocaleString();return td;}
 function cell(tr,text,sub){const td=node('td',text??'Unknown');if(sub)td.append(node('small',sub));tr.append(td);return td;}
 function errorText(error){return error?.category?[error.http_status,error.category.replaceAll('_',' ')].filter(Boolean).join(' · '):null;}
-function why(w){return [w.health_reason,['blocked','retrying'].includes(w.state)?errorText(w.error):null].filter(Boolean).join(' · ');}
+function why(w){return [w.health_reason,w.gemini_exhausted?'All enabled Gemini routes attempted · retrying after cooldown':null,['blocked','retrying'].includes(w.state)?errorText(w.error):null].filter(Boolean).join(' · ');}
 function openDetail(id){selected=id;detail();if(!$('detail').open)$('detail').showModal();}
 function renderSummary(rows){
  const labels={responding:'Responding',no_recent_response:'No recent response',unknown:'Unknown',inactive:'No active workers'};
@@ -27,6 +27,8 @@ function renderSummary(rows){
   tile.append(top,nums,node('p',active+' active · '+c.intentional+' retired in this view','muted'),node('p','Provider last response '+(f.last_response?age(f.last_response)+' ago':'unknown'),'muted'));return tile;
  }));
 }
+const keyLabels={working:'Responding',errors:'Provider failed',untried:'Untried',attempting:'Attempt in progress',interrupted:'Interrupted',last_success:'Last attempt succeeded',disabled:'Disabled',mixed:'Mixed results',unknown:'Unknown'};
+const keyTones={working:'working',errors:'down',untried:'intentional',attempting:'degraded',interrupted:'degraded',last_success:'intentional',disabled:'intentional',mixed:'degraded',unknown:'unknown'};
 function render(){if(!snapshot)return;
  $('updated').textContent='Updated '+new Date(snapshot.now*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
  const stale=snapshot.hosts.filter(h=>h.stale||h.error);$('banner').textContent=!snapshot.hosts.length?'Waiting for the first host collection.':stale.length?'Collection needs attention: '+stale.map(h=>h.host+(h.stale?' · stale':' · incomplete')).join(', '):'';
@@ -37,8 +39,6 @@ function render(){if(!snapshot)return;
  $('workers-title').textContent='Active workers ('+active.length+')';
  $('retired-title').textContent='Retired workers ('+retired.length+')';
  $('retired-panel').hidden=!$('show-paused').checked;
-const keyLabels={working:'Responding',errors:'Provider failed',untried:'Untried',attempting:'Attempt in progress',interrupted:'Interrupted',last_success:'Last attempt succeeded',disabled:'Disabled',mixed:'Mixed results',unknown:'Unknown'};
-const keyTones={working:'working',errors:'down',untried:'intentional',attempting:'degraded',interrupted:'degraded',last_success:'intentional',disabled:'intentional',mixed:'degraded',unknown:'unknown'};
 $('key-count').textContent=(snapshot.provider_keys||[]).length+' keys'+(snapshot.key_identity_unknown?' · '+snapshot.key_identity_unknown+' worker connections unidentified':'');
 const keyRows=[];
 for(const family of ['gemini','claude','codex']){
@@ -52,6 +52,21 @@ $('keys-empty').hidden=!!snapshot.provider_keys?.length;
 function workerRow(w){const tr=node('tr');tr.dataset.id=w.id;tr.addEventListener('click',()=>openDetail(w.id));const h=cell(tr,'');const badge=node('span',names[w.health],'badge '+tones[w.health]);badge.title=w.health_reason;h.append(badge,node('small',states[w.state]||'Unknown'));cell(tr,(w.problem||'Unknown').replaceAll('_',' '));const id=cell(tr,'');const b=node('button',w.handle||w.worker,'worker-link');b.title=w.run+'/'+w.worker;id.append(b,node('small',w.worker));cell(tr,w.model,w.host+' · route '+(w.route??'?'));tr.append(timeCell(w.last_response));cell(tr,why(w));return tr;}
 $('workers').replaceChildren(...active.map(workerRow));$('retired-workers').replaceChildren(...retired.map(workerRow));$('empty').hidden=active.length!==0;if(selected&&$('detail').open)detail();}
 function detail(){const w=snapshot.workers.find(x=>x.id===selected);if(!w)return;const d=$('detail');const top=node('div',undefined,'detail-top'),title=node('div');const h=node('h2',w.handle||w.worker);h.id='detail-title';title.append(h,node('p',w.run+'/'+w.worker,'muted'));const close=node('button','Close','button');close.type='button';close.addEventListener('click',()=>d.close());top.append(title,close);d.replaceChildren(top,node('p',why(w),'muted'));
+if(w.gemini_enabled?.length){
+ const routes=node('div',undefined,'detail-grid');
+ const outcomes=w.gemini_model_observations?.[w.model]||{};
+ for(const [i,id] of w.gemini_enabled.entries()){
+  const key=(snapshot.provider_keys||[]).find(k=>k.id===id);
+  const record=outcomes[id];
+  const status=record?.status||(w.process_alive&&w.provider_key_id===id?'attempting':'untried');
+  const row=node('div');
+  row.append(node('strong',(i+1)+'. '+(key?.display_name||key?.endpoint||'Provider')),
+             node('span',keyLabels[status],'badge '+keyTones[status]));
+  if(record){const when=node('small',(record.http_status?'HTTP '+record.http_status+' · ':'')+age(record.at)+' ago');when.title=new Date(record.at*1000).toLocaleString();row.append(when);}
+  routes.append(row);
+ }
+ d.append(node('h3','Gemini routes for '+w.model),routes);
+}
 const dl=node('dl',undefined,'detail-grid');const pairs=[['Health',names[w.health]],['Needs attention',w.attention_known?(w.needs_attention?'Yes · six hours without a model response':'No · six-hour threshold'):'Unknown evidence'],['Attention clock',age(w.attention_since)],['Process state',states[w.state]||'Unknown'],['Model / host',w.model+' · '+w.host],['Last real response',age(w.last_response)],['Last completed tool',age(w.last_tool)],['Last observed GPU progress',age(w.last_job_progress)],['Last public activity',w.last_public_activity?age(w.last_public_activity.at)+' · '+w.last_public_activity.kind:'Unknown'],['Registered',age(w.registered_at)],['This launch started',age(w.started_at)],['Complete interaction time','Unknown'],['Local platform receipt',w.last_platform_receipt?age(w.last_platform_receipt.at):'Unknown'],['Observed stalled time · 24 h',w.stalled_hours.toFixed(2)+' h / '+w.observed_hours.toFixed(2)+' h covered'],['GPUs held / observed hours · 24 h',(w.gpu.length?w.gpu.join(', '):'None')+' / '+w.gpu_hours.toFixed(2)+' h'],['Disk used / allowance',(w.disk_bytes===null?'Unknown':(w.disk_bytes/1e9).toFixed(1)+' GB')+' / '+(w.disk_allowance_gb??'?')+' GB'],['Published papers · 7 d / total',(w.papers_7d??'?')+' / '+(w.papers_total??'?')],['Owner messages',w.pending_messages+' pending · last receipt '+age(w.last_owner_received)],['Context',w.context_tokens?w.context_tokens.toLocaleString():'Not recorded'],['Host / account evidence',age(w.sampled_at)+' / '+age(w.profile_sampled_at)],['Controller update',w.upgrade_pending?'Waiting for a safe point':'None pending']];for(const [k,v]of pairs){const div=node('div');div.append(node('dt',k),node('dd',v));dl.append(div);}d.append(dl,node('h2','Seven-day work history'));
 const sc=node('div',undefined,'scroll'),strip=node('div',undefined,'strip');w.history.forEach((v,i)=>{const c=node('span',undefined,'cell '+(v||''));const at=(Math.floor(snapshot.now/3600)-167+i)*3600;c.title=new Date(at*1000).toLocaleString()+' · '+(v==='working'?'real work observed':v==='intentional'?'retired':v==='unknown'?'unknown evidence':v?'sampled without work this hour':'no coverage');strip.append(c);});sc.append(strip);d.append(sc);const legend=node('div',undefined,'legend');legend.append(node('span','7 days ago · blank = no coverage'),node('span','Now'));d.append(legend);}
 $('detail').addEventListener('close',()=>{selected=null;});
