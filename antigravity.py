@@ -107,7 +107,7 @@ def completed_turn(events):
                      and response_matches)))
 
 
-def prepare_profile(work, disable_web=False, model_name="gemini-4-carbon", context_tokens=500000, *, council=False, coder=False, adviser=False):
+def prepare_profile(work, disable_web=False, model_name="gemini-4-neon", context_tokens=500000, *, council=False, coder=False, adviser=False):
     home = Path(work) / ".home/.gemini"
     model = model_name if model_name.startswith("gemini-api://") else "gemini-api://" + model_name
     # This is the native model context budget, not an output or lifetime cap.
@@ -164,7 +164,7 @@ class AntigravityResume(BaseCliWorkerBackend):
     def prepare_launch(self, *, executable, run_dir, model_name, prompt, **kwargs):
         # API-key mode's built-in catalog can lag new Gemini releases. The native
         # custom-model selector passes the actual model ID to the configured API.
-        model = model_name or "gemini-4-carbon"
+        model = model_name or "gemini-4-neon"
         if not model.startswith("gemini-api://"):
             model = "gemini-api://" + model
         return PreparedCliWorkerLaunch(

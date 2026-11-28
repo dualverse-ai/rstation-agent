@@ -136,8 +136,8 @@ def test_dedicated_routes_rotate_without_station_fallback(tmp_path):
 def test_profile_tools_and_no_timeout(tmp_path):
     prepare_profile(tmp_path,False)
     settings=read(tmp_path/'.home/.gemini/antigravity-cli/settings.json')
-    assert settings['customModelsConfig']['customModels']['gemini-api://gemini-4-carbon']=={
-        'modelName':'gemini-api://gemini-4-carbon','maxTokens':500000}
+    assert settings['customModelsConfig']['customModels']['gemini-api://gemini-4-neon']=={
+        'modelName':'gemini-api://gemini-4-neon','maxTokens':500000}
     text=(tmp_path/'.home/.gemini/config/agents/rstation-researcher.md').read_text()
     assert 'search_web' in text and 'invoke_subagent' not in text and 'browser_subagent' not in text
     prepare_profile(tmp_path,True)
@@ -163,7 +163,7 @@ def test_context_budget_is_configurable_and_defaults_for_existing_runs(tmp_path)
         d=CliJobLaunchDecision('resume',1,1,'saved',1)
         m._build_cli_job_launch_spec('gemini_1','test',d,m.states['gemini_1'])
         p=tmp_path/'gemini_1/.home/.gemini/antigravity-cli/settings.json'
-        assert read(p)['customModelsConfig']['customModels']['gemini-api://gemini-4-carbon']['maxTokens']==500000
+        assert read(p)['customModelsConfig']['customModels']['gemini-api://gemini-4-neon']['maxTokens']==500000
     finally:m.close()
 
 
@@ -172,7 +172,7 @@ def test_running_manager_reloads_context_budget_on_same_session_resume(tmp_path)
     save(tmp_path/'run.json',c);prepare_workspaces(tmp_path,c)
     m=ResearchManager(tmp_path,c,environment(tmp_path));name='gemini_1'
     settings=tmp_path/name/'.home/.gemini/antigravity-cli/settings.json'
-    model='gemini-api://gemini-4-carbon'
+    model='gemini-api://gemini-4-neon'
     try:
         assert m.launch_cli_job(name);drain(m)
         assert m.states[name]['status']=='retrying'

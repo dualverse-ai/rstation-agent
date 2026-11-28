@@ -312,7 +312,7 @@ def parser():
     s.add_argument("--name");s.add_argument("--codex",type=int,default=1);s.add_argument("--claude",type=int,default=1)
     s.add_argument("--codex-model",default="gpt-6.2-astra");s.add_argument("--claude-model",default="claude-opus-5-5")
     s.add_argument("--gemini",type=int,default=1)
-    s.add_argument("--gemini-model",default="gemini-4-carbon")
+    s.add_argument("--gemini-model",default="gemini-4-neon")
     s.add_argument("--gemini-context-tokens",type=gemini_context_tokens,default=500000)
     s.add_argument("--subagents",type=int,default=0,help="Concurrent assistant slots per researcher (default: 0).")
     s.add_argument('--council',action=argparse.BooleanOptionalAction,default=True,help='Research council (default: on).')

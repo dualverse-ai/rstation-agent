@@ -11,7 +11,7 @@ import urllib.request
 
 from common import ROOT, NAME, alive, initial_prompt, lock, read, save
 
-MODELS = {'codex': ['gpt-6-astra'], 'claude': ['claude-opus-5-5'], 'gemini': ['gemini-4-carbon', 'gemini-4-argon']}
+MODELS = {'codex': ['gpt-6-astra'], 'claude': ['claude-opus-5-5'], 'gemini': ['gemini-4-neon', 'gemini-4-carbon', 'gemini-4-argon']}
 TERMINAL = {'complete', 'failed', 'cancelled'}
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 
@@ -45,7 +45,12 @@ class Store:
         return read(self.root/'store.json', {'sessions': {}})
 
     def policy(self):
-        return read(self.root/'policy.json', {})
+        policy = read(self.root/'policy.json', {})
+        models = policy.get('models', {})
+        choices = models.get('gemini', [])
+        if choices[:1] == ['gemini-4-carbon']:
+            models['gemini'] = ['gemini-4-neon', *(m for m in choices if m != 'gemini-4-neon')]
+        return policy
 
     def worker(self, name):
         config = read(self.run/'run.json', {})
@@ -87,6 +92,8 @@ class Store:
                     raise ValueError('Choose an adviser from a different model family.')
                 models = policy['models'].get(family, [])
                 chosen = model or (models[0] if models else None)
+                if not model and session and session['family'] == family:
+                    chosen = session['model']
                 if chosen not in models:
                     raise ValueError('Model unavailable; use ./'+self.capability+' models.')
                 if session and (session['family'], session['model']) != (family, chosen):

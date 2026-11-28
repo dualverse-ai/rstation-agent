@@ -37,7 +37,7 @@ Read the worker’s current settings, then submit a change using that revision:
 
 ```bash
 ./agents worker RUN_NAME gemini_1 status
-./agents worker RUN_NAME gemini_1 update --expect-revision 0 --model gemini-4-carbon --provider-route 2
+./agents worker RUN_NAME gemini_1 update --expect-revision 0 --model gemini-4-neon --provider-route auto
 ./agents worker RUN_NAME gemini_1 status
 ```
 

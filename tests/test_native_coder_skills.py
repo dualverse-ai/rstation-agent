@@ -33,7 +33,7 @@ def test_gemini_reads_installed_skills_and_applies_coder_result(tmp_path):
         def log_message(self,*_):pass
         def do_POST(self):
             body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            research='gemini-4-carbon:' in self.path
+            research='gemini-4-neon:' in self.path
             if research:requests.append(body)
             tools={t['name']:t for group in body.get('tools',[]) for t in group.get('functionDeclarations',[])}
             parts=[{'text':'Integration check finished.'}]

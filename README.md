@@ -50,7 +50,7 @@ Use the exact base URL supplied by each provider. Fill backup keys and endpoints
 ./agents stop RUN_NAME
 ```
 
-Default models are `gpt-6.2-astra`, `claude-opus-5-5` and `gemini-4-carbon`. Use `--codex-model`, `--claude-model` or `--gemini-model` to select models available from your providers.
+Default models are `gpt-6.2-astra`, `claude-opus-5-5` and `gemini-4-neon`. Use `--codex-model`, `--claude-model` or `--gemini-model` to select models available from your providers.
 
 | Option | Default | What it does |
 |---|---|---|
