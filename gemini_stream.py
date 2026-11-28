@@ -6,6 +6,7 @@ Upstream HTTPS uses the normal certificate verification and selected route.
 from contextlib import contextmanager
 from http.client import HTTPException
 import http.server
+import json
 import re
 import secrets
 import threading
@@ -48,6 +49,39 @@ class SSEComments:
         return bytes(output)
 
 
+def tool_result_roles(body):
+    """Match native result-only model turns to the immediately preceding calls."""
+    if b'"functionResponse"' not in body:
+        return body
+    try:
+        request = json.loads(body)
+    except (ValueError, UnicodeError):
+        return body
+    history = request.get('contents') if isinstance(request, dict) else None
+    if not isinstance(history, list):
+        return body
+    changed = False
+    for previous, turn in zip(history, history[1:]):
+        if not all(isinstance(row, dict) and row.get('role') == 'model' for row in (previous, turn)):
+            continue
+        replies = turn.get('parts')
+        parts = previous.get('parts')
+        if not isinstance(replies, list) or not replies or not isinstance(parts, list):
+            continue
+        if any(not isinstance(p, dict) or set(p) != {'functionResponse'} for p in replies):
+            continue
+        calls = [p['functionCall'] for p in parts if isinstance(p, dict) and 'functionCall' in p]
+        results = [p['functionResponse'] for p in replies]
+        if not all(isinstance(item, dict) and isinstance(item.get('name'), str) and item['name']
+                   and isinstance(item.get('id'), str) and item['id'] for item in calls + results):
+            continue
+        ids = [(call['id'], call['name']) for call in calls]
+        if len({ident for ident, name in ids}) == len(ids) and ids == [(r['id'], r['name']) for r in results]:
+            turn['role'] = 'user'
+            changed = True
+    return json.dumps(request, ensure_ascii=False).encode() if changed else body
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None  # Never forward provider credentials to another origin.
@@ -87,7 +121,7 @@ class GeminiStream:
                 except (TypeError, ValueError):
                     self.send_error(411)
                     return
-                if bridge.transform_body and size > 64 * 1024 * 1024:
+                if bridge.transform_body and bridge.transform_body is not tool_result_roles and size > 64 * 1024 * 1024:
                     self.send_error(413)
                     return
                 body = self.rfile.read(size)
@@ -112,7 +146,10 @@ class GeminiStream:
                 started = False
                 try:
                     try:
-                        response = opener.open(request, timeout=175) if bridge.transform_body else opener.open(request)
+                        if bridge.transform_body and bridge.transform_body is not tool_result_roles:
+                            response = opener.open(request, timeout=175)
+                        else:
+                            response = opener.open(request)
                     except HTTPError as error:
                         response = error  # Preserve HTTP failures for native retries.
                     with response:
@@ -158,8 +195,13 @@ class GeminiStream:
 
 @contextmanager
 def native_environment(kind, config, environment):
-    if kind != 'gemini' or not config.get('gemini_sse_compat', False):
+    if kind != 'gemini':
+        yield None
+        return
+    upstream = environment.get('GOOGLE_GEMINI_BASE_URL', '')
+    hapi = urlsplit(upstream).hostname == 'hapiopen.cc'
+    if not hapi and not config.get('gemini_sse_compat', False):
         yield None  # Inherit exactly the original environment when disabled.
         return
-    with GeminiStream(environment['GOOGLE_GEMINI_BASE_URL']) as bridge:
+    with GeminiStream(upstream, transform_body=tool_result_roles if hapi else None) as bridge:
         yield dict(environment, GOOGLE_GEMINI_BASE_URL=bridge.url)
