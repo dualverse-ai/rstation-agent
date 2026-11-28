@@ -54,6 +54,8 @@ def error(state):
  for key in ('worker_control_hold','session_adoption','worker_control'):
   category=state.get(key,{}).get('failure_category') or category
  if state.get('local_launch_error'):category='local_launch_error'
+ if state.get('blocked_reason')=='model_refusal':category='model_refusal'
+ if category=='model_refusal':return {'category':category,'http_status':None}
  if category not in ERRORS:category='unknown' if state.get('last_error') or state.get('blocked_reason') else None
  # Never emit provider text; extract only an HTTP status number.
  match=re.search(r'\b(?:HTTP(?:/\d(?:\.\d)?)?\s+|Error\s*:?\s*)(429|4\d\d|5\d\d)\b',str(state.get('last_error',''))[:4000],re.I)
@@ -182,6 +184,31 @@ def process_info(pid):
   if fields[0] in ('Z','X'):return None
   return {'parent':int(fields[1]),'token':fields[19]}
  except (OSError,ValueError,IndexError):return None
+
+
+def native_terminal_refusal(runtime,state,kind,now):
+ """Read only the current launch's terminal metadata, including stopped workers."""
+ launch=state.get('launches');started=number(state.get('started'))
+ if kind!='claude' or type(launch)!=int or launch<0 or not started:return False
+ try:
+  with (runtime/f'launch_{launch:06d}'/'transcript.jsonl').open('rb') as f:
+   import os
+   info=os.fstat(f.fileno())
+   if not started<=info.st_mtime<=now:return False
+   offset=max(0,info.st_size-2*1024*1024);f.seek(offset)
+   if offset:f.readline()
+   data=f.read(2*1024*1024)
+ except OSError:return False
+ refusal=False
+ for line in data.splitlines(keepends=True):
+  if not line.endswith(b'\n'):continue
+  try:event=json.loads(line)
+  except ValueError:continue
+  if not isinstance(event,dict):continue
+  if event.get('type')=='system' and event.get('subtype')=='init':refusal=False
+  elif event.get('type')=='result':
+   refusal=event.get('is_error') is True and event.get('stop_reason')=='refusal'
+ return refusal
 
 
 def native_provider_retry(runtime,state,kind,now):
@@ -527,6 +554,9 @@ def collect(roots,host):
          'handle':handle,'sampled_at':now,'error':error(state),
          'last_platform_receipt':None,'last_interaction':None,'provider_key_id':selected_key['id'] if selected_key else None,
          'provider_key_source':selected_key['source'] if selected_key else None}
+    if native_terminal_refusal(runtime,state,worker.get('kind'),now):
+     row['error']={'category':'model_refusal','http_status':None}
+     row['native_provider_retry']=None
     # Operator-maintained reason metadata is explicitly required; PAUSE alone is not evidence of owner intent.
     reason=read(runtime/'operator-pause.json')
     row['intentional_stop']=bool(status in ('paused','stopped') and reason.get('owner_authorized') is True and reason.get('message_id'))

@@ -179,7 +179,7 @@ class ResearchManager(CliJobManager):
         from provider_control import refresh
         refresh(self,name)
         from worker_control import guard_launch
-        if not guard_launch(self,name):
+        if self.states[name].get("blocked_reason")=="model_refusal" or not guard_launch(self,name):
             s=self.states[name]
             return CliJobState(self.worker(name)["kind"],s["spawn"],s["resumes"],2**31,14,s.get("token"),s.get("next",0),False,False)
         s=self.states[name]
@@ -189,7 +189,7 @@ class ResearchManager(CliJobManager):
         return f"launch_{self.states[name]['launches']+1:06d}"
     def _claim_cli_job_launch(self,name,session_id,decision):
         from worker_control import guard_launch
-        if not guard_launch(self,name):return None
+        if self.states[name].get("blocked_reason")=="model_refusal" or not guard_launch(self,name):return None
         s=self.states[name]
         s.update(spawn=decision.spawn_count,resumes=decision.resume_count,launches=s["launches"]+1,
                  status="starting",route_count=decision.endpoint_resume_count or 0)
@@ -415,6 +415,11 @@ class ResearchManager(CliJobManager):
     @staticmethod
     def completed(session):
         events=list(CliJobManager._read_transcript_events(session.transcript_path))
+        if getattr(session,"backend",None)=="claude":
+            results=[e for e in events if isinstance(e,dict) and e.get("type")=="result"]
+            return bool(results and not results[-1].get("is_error",False)
+                        and results[-1].get("stop_reason")!="refusal"
+                        and results[-1].get("subtype") not in {"error_max_turns","error_during_execution"})
         if any(e.get("event")=="result" for e in events if isinstance(e,dict)):
             return completed_turn(e for e in events if isinstance(e,dict))
         for e in events:
@@ -431,12 +436,22 @@ class ResearchManager(CliJobManager):
                  pid=None,last_success=time.time(),route_count=0,route_offset=index-seed)
         self._endpoint_resume_counts[name]=0
         self.persist(name);self.log(name,"Turn completed; continuing research." if not self.probe else "Model connectivity check passed.")
+    def _block_model_refusal(self,name,failure):
+        if failure.category!="model_refusal":return False
+        state=self.states[name]
+        state.update(status="blocked",blocked_reason="model_refusal",next=0,pid=None,
+                     last_failure_category="model_refusal",last_error="Native model refusal")
+        self.persist(name)
+        self.log(name,"Native model refusal; conversation retained for operator review.")
+        return True
+
     @serialize_failure
     def _schedule_cli_job_resume(self,name,session,failure):
         from worker_control import handle_failure
         from gemini_failover import schedule
         if schedule(self,name,session,failure):return
         if handle_failure(self,name,failure):return
+        if self._block_model_refusal(name,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
         s=self.states[name]
@@ -463,7 +478,7 @@ class ResearchManager(CliJobManager):
             if event.get("type")=="result":
                 result_text=str(event.get("result","")).lower()
                 confirmed_model_refusal=(getattr(session,"backend",None)=="claude" and bool(event.get("is_error"))
-                    and (model_refusal in result_text or (turn_model_refusal and
+                    and (event.get("stop_reason")=="refusal" or model_refusal in result_text or (turn_model_refusal and
                          (event.get("stop_reason")=="refusal" or "claude code is unable to respond" in result_text))))
                 turn_model_refusal=False
             if event.get("type")=="system" and event.get("subtype")=="api_retry":
@@ -477,7 +492,9 @@ class ResearchManager(CliJobManager):
         markers=("no conversation found with session id","session not found","no session found",
                  "conversation not found","failed to load session","could not find session",
                  "no rollout found for thread id")
-        if confirmed_model_refusal or any(marker in detail for marker in markers):
+        if confirmed_model_refusal:
+            return CliJobFailure("model_refusal",False,"Native model refusal; retain conversation for operator review.")
+        if any(marker in detail for marker in markers):
             self.states[name]["session_unavailable"]=True
             return CliJobFailure("session_unavailable",False,"The CLI reports that the saved conversation is unavailable.")
         if provider_unavailable(detail):
@@ -491,6 +508,7 @@ class ResearchManager(CliJobManager):
         from gemini_failover import schedule
         if schedule(self,name,session,failure):return
         if handle_failure(self,name,failure):return
+        if self._block_model_refusal(name,failure):return
         self._record_primary_failure(name)
         if self._maybe_recover_session(name,session,failure):return
         s=self.states[name]

@@ -757,6 +757,7 @@ def test_claude_model_refusal_requires_failed_turn(tmp_path,source,failed,expect
     if source=="policy_only":event["message"]["content"][0]["text"]="Another provider notice."
     events=[event,{"type":"result","subtype":"success","is_error":failed,"stop_reason":"refusal",
                    "result":"API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy."}]
+    if source in ("user","tool","quote","policy_only"):events[-1]["stop_reason"]=None
     if source=="transient":events[-1].update(result="HTTP 429",stop_reason=None)
     if source=="historical":events += [{"type":"result","is_error":False,"result":"Research continued."},
                                       {"type":"result","is_error":True,"result":"HTTP 503"}]
@@ -768,13 +769,14 @@ def test_claude_model_refusal_requires_failed_turn(tmp_path,source,failed,expect
     try:
         m.states["claude_1"].update(token="retained",spawn=1)
         failure=m._classify_cli_job_failure("claude_1",session)
-        assert (failure.category=="session_unavailable")==expected
+        assert (failure.category=="model_refusal")==expected
         m._schedule_cli_job_fresh_attempt("claude_1",session,failure)
-        assert m.states["claude_1"]["token"]==(None if expected else "retained")
+        assert m.states["claude_1"]["token"]=="retained"
+        assert (m.states["claude_1"].get("blocked_reason")=="model_refusal")==expected
     finally:m.close()
 
 
-def test_claude_refused_conversation_recovers_after_controller_restart(tmp_path):
+def test_claude_refused_conversation_remains_blocked_after_controller_restart(tmp_path):
     c=cfg(tmp_path,"claude");save(tmp_path/"run.json",c);prepare_workspaces(tmp_path,c)
     environment=env(tmp_path,"claude");script=Path(environment["CLAUDE_BIN_PATH"])
     script.write_text("#!"+sys.executable+"\n"+'''import json,sys,pathlib
@@ -792,17 +794,16 @@ print(json.dumps({"type":"result","subtype":"success","is_error":resuming,"stop_
     try:
         m.states["claude_1"].update(token="unusable-session",spawn=1)
         assert m.launch_cli_job("claude_1");drain(m)
-        assert m.states["claude_1"]["session_unavailable"]
-        assert m.states["claude_1"]["token"] is None
+        assert m.states["claude_1"].get("blocked_reason")=="model_refusal"
+        assert m.states["claude_1"]["token"]=="unusable-session"
     finally:m.close()
     m=ResearchManager(tmp_path,c,environment)
     try:
-        assert m.states["claude_1"]["token"] is None
+        assert m.states["claude_1"]["token"]=="unusable-session"
+        assert m.states["claude_1"]["blocked_reason"]=="model_refusal"
         m.states["claude_1"]["next"]=0
-        assert m.launch_cli_job("claude_1");drain(m)
-        assert m.states["claude_1"]["token"]=="fresh-session"
-        assert m.states["claude_1"]["status"]=="continuing"
-        assert not m.states["claude_1"].get("session_unavailable")
-        assert (tmp_path/"claude_1/research-recovered").read_text()==notes.read_text()
+        assert not m.launch_cli_job("claude_1")
+        assert not (tmp_path/"claude_1/research-recovered").exists()
+        assert notes.read_text()=="Preserved research plan and findings."
         assert (tmp_path/"claude_1/.runtime/launch_000001/transcript.jsonl").exists()
     finally:m.close()

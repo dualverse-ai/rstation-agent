@@ -36,6 +36,8 @@ def health(row,now):
   return 'needs_attention','No real model response for at least 6 hours'
  sample=row.get('sampled_at')
  if number(sample) is None or not 0<=now-sample<=300:return 'transient_error','Host evidence is missing or stale'
+ if row.get('error',{}).get('category')=='model_refusal':
+  return 'transient_error','Native model refusal; operator review required'
  retry=row.get('native_provider_retry')
  if isinstance(retry,dict) and number(retry.get('at')) is not None and 0<=now-retry['at']<=300:
   return 'transient_error','Native provider retry'+(' · HTTP '+str(retry['http_status']) if retry.get('http_status') else '')
